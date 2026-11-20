@@ -32,12 +32,14 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
 import serial
+from rich.highlighter import Highlighter
 from rich.text import Text
 from serial.tools import list_ports
 from textual import on, work
@@ -45,7 +47,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
-from textual.widgets import (Button, Footer, Header, RichLog, Sparkline, Static,
+from textual.widgets import (Button, Footer, Header, Log, Sparkline, Static,
                              TabbedContent, TabPane)
 from textual_plotext import PlotextPlot
 
@@ -105,24 +107,74 @@ def age(seconds: float) -> str:
     return f"{seconds / 3600:.1f} h"
 
 
-def styled_log_line(line: str) -> Text:
+def serial_line_style(line: str) -> str:
     if line.startswith("---"):
-        return Text(line, style="bold cyan")
+        return "bold cyan"
     m = LEVEL_RE.search(line)
-    return Text(line, style=LEVEL_STYLE.get(m.group(1), "") if m else "")
+    return LEVEL_STYLE.get(m.group(1), "") if m else ""
 
 
-def styled_build_line(line: str) -> Text:
+def build_line_style(line: str) -> str:
     low = line.lower()
     if "[success]" in low:
-        return Text(line, style="bold green")
+        return "bold green"
     if "error" in low or "[failed]" in low or "failed" in low:
-        return Text(line, style="red")
+        return "red"
     if "warning" in low:
-        return Text(line, style="yellow")
-    if line.startswith("$ "):
-        return Text(line, style="bold")
-    return Text(line)
+        return "yellow"
+    if line.startswith("$ ") or line.startswith("échec du lancement"):
+        return "bold"
+    return ""
+
+
+class LineStyler(Highlighter):
+    """Colours a whole log line from a `line -> style` function."""
+
+    def __init__(self, style_for) -> None:
+        self.style_for = style_for
+
+    def highlight(self, text: Text) -> None:
+        if style := self.style_for(text.plain):
+            text.stylize(style)
+
+
+class StyledLog(Log):
+    """A `Log` (mouse-selectable, unlike `RichLog`) with per-line colours.
+
+    Drag with the mouse to select, Ctrl+C copies the selection; `c` copies
+    the whole log (see AqaMonitor.action_copy_log).
+    """
+
+    def __init__(self, style_for, **kwargs) -> None:
+        super().__init__(highlight=True, **kwargs)
+        self.highlighter = LineStyler(style_for)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+def system_clipboard_copy(text: str) -> bool:
+    """Copy through wl-copy / xclip / xsel / pbcopy when one is installed.
+
+    Textual only emits OSC 52, which some terminals (GNOME Terminal, Konsole
+    by default…) ignore, so this is the reliable path on a desktop session.
+    """
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"], ["pbcopy"]):
+        if not shutil.which(cmd[0]):
+            continue
+        if cmd[0] == "wl-copy" and not os.environ.get("WAYLAND_DISPLAY"):
+            continue
+        if cmd[0] in ("xclip", "xsel") and not os.environ.get("DISPLAY"):
+            continue
+        try:
+            subprocess.run(cmd, input=text.encode(), check=True, timeout=2,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
 
 
 # --------------------------------------------------------------------------- data
@@ -306,7 +358,7 @@ class AqaMonitor(App):
     #build-info { height: auto; padding: 0 1; }
     #build-buttons { height: 3; }
     #build-buttons Button { margin-right: 1; }
-    RichLog { border: round $panel; }
+    StyledLog { border: round $panel; }
     """
     BINDINGS = [
         Binding("q", "quit", "Quitter"),
@@ -322,6 +374,7 @@ class AqaMonitor(App):
         Binding("f", "flash", "Flash"),
         Binding("r", "reset_board", "Reset carte"),
         Binding("s", "save_csv", "CSV"),
+        Binding("c", "copy_log", "Copier log"),
     ]
 
     def __init__(self, args: argparse.Namespace) -> None:
@@ -352,7 +405,7 @@ class AqaMonitor(App):
                         yield MetricCard(i)
                 yield Chart(id="chart")
             with TabPane("Log série", id="log"):
-                yield RichLog(id="serial-log", max_lines=5000, wrap=False, markup=False)
+                yield StyledLog(serial_line_style, id="serial-log", max_lines=5000)
             with TabPane("Build & Flash", id="build"):
                 yield Static(id="build-info")
                 with Horizontal(id="build-buttons"):
@@ -360,7 +413,7 @@ class AqaMonitor(App):
                     yield Button("Flash", id="btn-flash", variant="success")
                     yield Button("Clean", id="btn-clean")
                     yield Button("Stop", id="btn-stop", variant="error", disabled=True)
-                yield RichLog(id="build-log", max_lines=5000, wrap=False, markup=False)
+                yield StyledLog(build_line_style, id="build-log", max_lines=5000)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -448,7 +501,7 @@ class AqaMonitor(App):
             self.serial = None
 
     def handle_line(self, line: str) -> None:
-        self.query_one("#serial-log", RichLog).write(styled_log_line(line))
+        self.query_one("#serial-log", StyledLog).write_line(line)
         if self.telemetry.ingest(line):
             self.refresh_metrics()
         self.refresh_status()
@@ -520,7 +573,7 @@ class AqaMonitor(App):
 
     @work(exclusive=True, group="build")
     async def run_pio(self, label: str, extra: list[str]) -> None:
-        log = self.query_one("#build-log", RichLog)
+        log = self.query_one("#build-log", StyledLog)
         self.query_one(TabbedContent).active = "build"
         if not self.pio:
             self.notify("pio introuvable", severity="error")
@@ -539,7 +592,7 @@ class AqaMonitor(App):
             self.close_port()
 
         log.clear()
-        log.write(Text("$ " + " ".join(args), style="bold"))
+        log.write_line("$ " + " ".join(args))
         self.build_label, self.build_result = label, ""
         self.set_running(True)
         self.refresh_build_info()
@@ -550,10 +603,10 @@ class AqaMonitor(App):
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             assert self.build_proc.stdout
             async for raw in self.build_proc.stdout:
-                log.write(styled_build_line(raw.decode("utf-8", "replace").rstrip()))
+                log.write_line(raw.decode("utf-8", "replace").rstrip())
             code = await self.build_proc.wait()
         except OSError as exc:
-            log.write(Text(f"échec du lancement : {exc}", style="bold red"))
+            log.write_line(f"échec du lancement : {exc}")
             code = -1
         finally:
             self.build_proc = None
@@ -593,6 +646,24 @@ class AqaMonitor(App):
             except Exception:
                 return False
         return True
+
+    def copy_to_clipboard(self, text: str) -> None:
+        # Used by Ctrl+C on a mouse selection too: OSC 52 plus the system tool.
+        super().copy_to_clipboard(text)
+        system_clipboard_copy(text)
+
+    def action_copy_log(self) -> None:
+        tab = self.query_one(TabbedContent).active
+        log_id = {"log": "#serial-log", "build": "#build-log"}.get(tab)
+        if log_id is None:
+            self.notify("ouvre l'onglet Log ou Build pour copier", severity="warning")
+            return
+        log = self.query_one(log_id, StyledLog)
+        if not log.line_count:
+            self.notify("log vide", severity="warning")
+            return
+        self.copy_to_clipboard(log.text)
+        self.notify(f"{log.line_count} lignes copiées")
 
     def action_tab(self, tab: str) -> None:
         self.query_one(TabbedContent).active = tab
