@@ -3,6 +3,7 @@
 compile_commands.json
 
 # Local overrides: never commit real credentials or private keys.
+.env
 secrets.local.h
 *.pem
 *.der

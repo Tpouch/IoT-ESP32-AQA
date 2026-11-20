@@ -1,6 +1,11 @@
 #include "ota_manager.h"
 #include <esp_ota_ops.h>
 #include <esp_err.h>
+#include <esp_task_wdt.h>
+
+// WiFiClient::setTimeout() takes SECONDS on the ESP32 core (the old 60000
+// meant ~17 h per stalled read). Keep it below the 30 s loop watchdog.
+static const uint32_t OTA_READ_TIMEOUT_S = 20;
 
 void OTAManager::init(const uint8_t* publicKey, size_t keyLen, 
                      const char* firmwareUrl, const char* signatureUrl,
@@ -93,7 +98,7 @@ bool OTAManager::performUpdate() {
     }
 
     WiFiClient* client = firmwareHttp.getStreamPtr();
-    client->setTimeout(60000);
+    client->setTimeout(OTA_READ_TIMEOUT_S);
     const size_t bufSize = 4096;
     std::unique_ptr<uint8_t[]> buf(new uint8_t[bufSize]);
     if (!buf) {
@@ -133,6 +138,7 @@ bool OTAManager::performUpdate() {
         
         while (bytesRead == 0 && retries < maxRetries) {
             yield();
+            esp_task_wdt_reset();  // a slow download must not trip the loop watchdog
             bytesRead = client->readBytes(buf.get(), bytesToRead);
             lastReadTime = millis();
             
@@ -172,15 +178,16 @@ bool OTAManager::performUpdate() {
     networkManager.publishMessage(statusTopic, "Signature verified");
 
     // Perform update
-    firmwareHttp.begin(firmwareUrl);
-    firmwareHttp.setTimeout(120000);
-    client = firmwareHttp.getStreamPtr();
-    client->setTimeout(120000);
+    // httpUpdate opens its own connection. getStreamPtr() on an HTTPClient
+    // that has not sent a request returns nullptr, which used to crash here.
+    WiFiClient updateClient;
+    updateClient.setTimeout(OTA_READ_TIMEOUT_S);
+    httpUpdate.onProgress([](int, int) { esp_task_wdt_reset(); });
     
     LOG_I("Starting firmware installation...");
     networkManager.publishMessage(statusTopic, "Installing firmware");
     
-    t_httpUpdate_return ret = httpUpdate.update(*client, firmwareUrl);
+    t_httpUpdate_return ret = httpUpdate.update(updateClient, firmwareUrl);
 
     switch (ret) {
         case HTTP_UPDATE_FAILED:
@@ -275,7 +282,7 @@ bool OTAManager::performUpdateFromMqtt(const char* url, const char* version,
         return false;
     }
     WiFiClient* client = firmwareHttp.getStreamPtr();
-    client->setTimeout(60000);
+    client->setTimeout(OTA_READ_TIMEOUT_S);
     const size_t bufSize = 4096;
     std::unique_ptr<uint8_t[]> buf(new uint8_t[bufSize]);
     if (!buf) {
@@ -300,6 +307,7 @@ bool OTAManager::performUpdateFromMqtt(const char* url, const char* version,
         int retries = 0;
         while (bytesRead == 0 && retries < maxRetries) {
             yield();
+            esp_task_wdt_reset();  // a slow download must not trip the loop watchdog
             bytesRead = client->readBytes(buf.get(), bytesToRead);
             if (bytesRead == 0) { retries++; delay(100 * retries); }
         }
@@ -320,11 +328,12 @@ bool OTAManager::performUpdateFromMqtt(const char* url, const char* version,
     }
     firmwareHttp.end();
 
-    firmwareHttp.begin(url);
-    firmwareHttp.setTimeout(120000);
-    client = firmwareHttp.getStreamPtr();
-    client->setTimeout(120000);
-    t_httpUpdate_return ret = httpUpdate.update(*client, url);
+    // httpUpdate opens its own connection. getStreamPtr() on an HTTPClient
+    // that has not sent a request returns nullptr, which used to crash here.
+    WiFiClient updateClient;
+    updateClient.setTimeout(OTA_READ_TIMEOUT_S);
+    httpUpdate.onProgress([](int, int) { esp_task_wdt_reset(); });
+    t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
     firmwareHttp.end();
     if (ret == HTTP_UPDATE_OK) {
         reportOtaStatus("completed", 100);

@@ -79,13 +79,12 @@ void DataManager::pmSampleCallback() {
 void DataManager::co2SampleCallback() {
     if (instance && instance->hal) {
         if (instance->hal->isSensorInitialized(SENSOR_CO2)) {
+            // One attempt per tick: the next tick is CO2_SAMPLE_TIME away, and
+            // retrying here would block the sound and PM tasks for seconds.
             int co2;
-            int8_t temp;
-            if (instance->hal->getCO2Sensor().readWithRetry(co2, temp, 5, 500)) {
+            if (instance->hal->getCO2Sensor().read(co2)) {
                 instance->co2Samples.push_back(co2);
-                LOG_D("CO2: %d ppm, Temperature: %d°C", co2, temp);
-            } else {
-                LOG_W("CO2 sensor read failed after retries");
+                LOG_D("CO2: %d ppm", co2);
             }
         } else {
             LOG_V("CO2 sensor not initialized, skipping reading");

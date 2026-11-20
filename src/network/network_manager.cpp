@@ -15,7 +15,7 @@ String NetworkManager::generateDeviceID() {
 
 bool NetworkManager::connectWithSecrets(unsigned long timeoutMs) {
     if (String(WIFI_SSID) == "CHANGE_ME") {
-        LOG_I("no station credentials in secrets.local.h; using the config portal");
+        LOG_I("no WIFI_SSID in .env; using the config portal");
         return false;
     }
 

@@ -32,10 +32,9 @@ public:
     
     // Initialize specific sensors, returns true if successful
     bool initTemperatureSensor(int dhtPin, int sclPin);
-    bool initCO2Sensor(int rxPin, int txPin, HardwareSerial& serial, 
-                       CO2Sensor::SensorType co2Type = CO2Sensor::SensorType::NONE, 
-                       bool autoDetect = true);
-    bool initPMSensor(int rxPin, int txPin);
+    bool initCO2Sensor(HardwareSerial& serial, int espRx, int espTx,
+                       CO2Sensor::SensorType co2Type = CO2Sensor::SensorType::NONE);
+    bool initPMSensor(int espRx, int espTx);
     bool initSoundSensor(int adcPin);
 
     // Getters with initialization check
@@ -66,6 +65,9 @@ private:
     unsigned long verifyCO2SensorTimestamp;
     
     const int MAX_INIT_RETRIES = 3;
-    
-    uint8_t sensorStatus = 0;  // Bitmap to track sensor status
+
+    // Detection is protocol-level, so one retry covers a slow power-up. Each
+    // failed attempt can cost ~5 s (the S8 library's UART timeout).
+    static const int CO2_INIT_ATTEMPTS = 2;
+    static const unsigned long CO2_WARMUP_MS = 60000;
 }; 

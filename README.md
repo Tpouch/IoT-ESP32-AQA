@@ -23,12 +23,21 @@ Every tag builds: `tools/build-all-tags.sh` builds all of them in isolated
 worktrees. The full tag map, session mapping and reveal policy live in
 [docs/ladder.md](docs/ladder.md).
 
-## Secrets
+## Secrets (`.env`)
 
-`src/utils/secrets.h` ships with training defaults so every tag compiles as
-cloned. Real credentials belong in a gitignored `secrets.local.h` beside it;
-`secrets.h` includes that file when present. Never commit a real password or a
-private key.
+Wi-Fi, MQTT and OTA settings come from a gitignored `.env` at the project root:
+
+```bash
+cp .env.example .env     # then set WIFI_SSID / WIFI_PASSWORD (and MQTT_* if needed)
+pio run -e ttgo-t7-v14-mini32 --target upload
+```
+
+`tools/load_env.py` runs before every build and writes the values into a
+generated header (`.pio/build/<env>/generated/env_secrets.h`), which
+`src/utils/secrets.h` includes. Keys missing from `.env` keep the defaults in
+`secrets.h`, so the project still builds as cloned. Changing `.env` triggers a
+rebuild; the build log lists which keys were loaded, never their values.
+Never commit `.env` or a private key.
 
 ## Stage 00 — `v0.0-toolchain`
 
@@ -168,7 +177,7 @@ Acceptance:
 
 ## Stage 10 — `v0.10-wifi`
 
-Association as a state machine. Credentials come from `secrets.local.h` when
+Association as a state machine. Credentials come from `.env` when
 present, otherwise a captive portal persisted in NVS. The device ID is the Wi-Fi
 MAC with the `aqa-` prefix, so it survives reflashing. RSSI is logged because
 "connected" is not "usable".

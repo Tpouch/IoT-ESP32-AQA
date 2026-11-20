@@ -9,6 +9,7 @@
 #include "public_key.h"
 #include "utils/config_manager.h"
 #include "utils/logger.h"
+#include "utils/secrets.h"
 #include "utils/task_manager.h"
 
 // Stage v1.0-ota
@@ -47,7 +48,7 @@ void setup() {
     Logger::getInstance().begin(115200, LOG_INFO);
     pinMode(HEARTBEAT_LED, OUTPUT);
 
-    LOG_I("stage v0.12-commands on %s", ARDUINO_BOARD);
+    LOG_I("firmware %s on %s", FIRMWARE_VERSION, ARDUINO_BOARD);
 
     String deviceId = network.generateDeviceID();
     Config().init(deviceId);
