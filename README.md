@@ -23,6 +23,21 @@ Every tag builds: `tools/build-all-tags.sh` builds all of them in isolated
 worktrees. The full tag map, session mapping and reveal policy live in
 [docs/ladder.md](docs/ladder.md).
 
+## Dashboard TUI
+
+```bash
+uv run tools/aqa_tui.py            # board on the first USB serial port
+uv run tools/aqa_tui.py --demo     # simulated data, no board
+```
+
+A [Textual](https://textual.textualize.io/) app whose dependencies (Textual,
+textual-plotext, pyserial, PlatformIO) are declared inline (PEP 723), so `uv`
+installs them on first run; PlatformIO comes with them, no separate install.
+Three tabs: live sensor values and graphs (parsed from the frames in the
+serial log; click a card or use ←/→), the raw serial log, and build & flash
+(`b`, `f`; the serial port is released while esptool flashes). `r` resets the
+board, `s` exports the history to `aqa-<date>.csv`.
+
 ## Secrets (`.env`)
 
 Wi-Fi, MQTT and OTA settings come from a gitignored `.env` at the project root:

@@ -8,3 +8,7 @@ secrets.local.h
 *.pem
 *.der
 tools/keys/
+
+# Exports from tools/aqa_tui.py
+aqa-*.csv
+__pycache__/
