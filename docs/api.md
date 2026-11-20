@@ -1,6 +1,6 @@
 # API HTTPS du capteur AQA
 
-Contrat entre le firmware (≥ 2.0.0) et le serveur, par exemple
+Contrat entre le firmware (≥ 2.0.0, commande `wifi` ≥ 2.1.0) et le serveur, par exemple
 `https://sensor.devgoblin.fr`. Tout ce que la carte envoie et tout ce qu'elle
 comprend est décrit ici. Les routes « app » de la fin sont des suggestions pour
 ton interface web : le firmware ne les appelle pas.
@@ -223,6 +223,7 @@ Le serveur glisse les commandes en attente dans la réponse de `/status` ou de
 | `restart` | — | Ack `completed` (`"rebooting"`), puis reboot ~1,5 s après. Le prochain `/status` aura `boot_count` +1. |
 | `ota` | `{ "url": "...", "signature_url": "...", "version": "2.0.1" }` | Mise à jour signée, voir §3.2. |
 | `rollback` | — | Redémarre sur l'image précédente si elle est valide. Ack `completed` puis reboot, ou `failed` (`"no valid previous image"`). |
+| `wifi` | `{ "ssid", "password" }` (WPA2, mot de passe vide = réseau ouvert), `{ "ssid", "eap_username", "eap_password", "eap_identity"? }` (PEAP), ou `{ "reset": true }` | *Firmware ≥ 2.1.0.* Ack `in_progress`, puis la carte essaie le réseau pendant 20 s. Si ça marche, il est enregistré (NVS) et prioritaire sur le `.env` aux démarrages suivants : ack `completed` (`"connected to X (-62 dBm)"`). Sinon, elle **revient sur le réseau précédent** et ack `failed`. `reset` oublie le réseau distant et reprend celui du `.env`. Le serveur doit effacer les mots de passe de sa base dès l'ack final, et ne jamais les renvoyer au navigateur. |
 | autre | — | Ack `failed` (`"unknown command type"`). |
 
 ### 3.1 Cycle de vie conseillé côté serveur

@@ -3,7 +3,7 @@
 #include <ArduinoJson.h>
 
 // Commands delivered in API responses: {"id": "...", "type": "...", "params": {...}}.
-// Types: status, config, geohash, restart, ota, rollback (docs/api.md).
+// Types: status, config, geohash, restart, ota, rollback, wifi (docs/api.md).
 namespace Commands {
 
 // Runs one command and acks it through ApiClient. Commands whose id matches

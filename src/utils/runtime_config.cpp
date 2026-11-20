@@ -1,5 +1,6 @@
 #include "runtime_config.h"
 #include "secrets.h"
+#include "network/network_manager.h"
 #include <Preferences.h>
 
 const char* RuntimeConfig::NVS_DEVICE = "device";
@@ -8,6 +9,7 @@ const char* RuntimeConfig::KEY_GEOHASH = "geohash";
 const char* RuntimeConfig::KEY_BOOT_COUNT = "boot_count";
 const char* RuntimeConfig::KEY_PARAMS_JSON = "p";
 const char* RuntimeConfig::KEY_LAST_COMMAND = "last_cmd";
+const char* RuntimeConfig::NVS_WIFI = "wifi";
 
 void RuntimeConfig::begin() {
     incrementBootCount();
@@ -44,6 +46,40 @@ void RuntimeConfig::setLastCommandId(const char* id) {
     Preferences prefs;
     if (!prefs.begin(NVS_DEVICE, false)) return;
     prefs.putString(KEY_LAST_COMMAND, id);
+    prefs.end();
+}
+
+bool RuntimeConfig::getWifiOverride(WifiCreds& out) const {
+    Preferences prefs;
+    if (!prefs.begin(NVS_WIFI, true)) return false;
+    bool present = prefs.isKey("ssid");
+    if (present) {
+        out.ssid = prefs.getString("ssid", "");
+        out.password = prefs.getString("pass", "");
+        out.eapUser = prefs.getString("eap_user", "");
+        out.eapPassword = prefs.getString("eap_pass", "");
+        out.eapIdentity = prefs.getString("eap_id", "");
+    }
+    prefs.end();
+    return present && out.ssid.length() > 0;
+}
+
+void RuntimeConfig::setWifiOverride(const WifiCreds& c) {
+    Preferences prefs;
+    if (!prefs.begin(NVS_WIFI, false)) return;
+    prefs.clear();
+    prefs.putString("ssid", c.ssid);
+    prefs.putString("pass", c.password);
+    prefs.putString("eap_user", c.eapUser);
+    prefs.putString("eap_pass", c.eapPassword);
+    prefs.putString("eap_id", c.eapIdentity);
+    prefs.end();
+}
+
+void RuntimeConfig::clearWifiOverride() {
+    Preferences prefs;
+    if (!prefs.begin(NVS_WIFI, false)) return;
+    prefs.clear();
     prefs.end();
 }
 

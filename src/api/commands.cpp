@@ -3,6 +3,7 @@
 #include <Arduino.h>
 
 #include "api/api_client.h"
+#include "network/network_manager.h"
 #include "ota/ota_manager.h"
 #include "utils/logger.h"
 #include "utils/runtime_config.h"
@@ -82,6 +83,42 @@ void runOta(const char* id, JsonObject params) {
     scheduleReboot();
 }
 
+// {"reset": true} | {"ssid", "password"} | {"ssid", "eap_username", "eap_password", "eap_identity"?}
+void runWifi(const char* id, JsonObject params) {
+    bool reset = params["reset"] | false;
+    WifiCreds creds;
+    if (!reset) {
+        creds.ssid = params["ssid"] | "";
+        creds.password = params["password"] | "";
+        creds.eapUser = params["eap_username"] | "";
+        creds.eapPassword = params["eap_password"] | "";
+        creds.eapIdentity = params["eap_identity"] | "";
+        if (creds.ssid.length() == 0 || creds.ssid.length() > 32) {
+            ack(id, "failed", "params.ssid must be 1-32 characters");
+            return;
+        }
+        if (creds.isEnterprise() && creds.eapPassword.length() == 0) {
+            ack(id, "failed", "params.eap_password is required with eap_username");
+            return;
+        }
+    }
+
+    // Tell the server before dropping the link; the outcome is acked once
+    // the board is back online, on the new network or on the previous one.
+    ack(id, "in_progress", reset ? "back to the .env network" : "joining new network", 0);
+    ApiClient::getInstance().releaseConnection();
+
+    String error;
+    bool ok = NetworkManager::getInstance().switchNetwork(reset ? nullptr : &creds, error);
+    if (ok) {
+        String detail = String("connected to ") + WiFi.SSID() + " (" + WiFi.RSSI() + " dBm)";
+        ack(id, "completed", detail.c_str(), 100);
+        ApiClient::getInstance().requestStatus();
+    } else {
+        ack(id, "failed", error.c_str());
+    }
+}
+
 void runRollback(const char* id) {
     String error;
     if (!OTAManager::getInstance().rollback(error)) {
@@ -118,6 +155,7 @@ void Commands::execute(JsonObject command) {
     else if (strcmp(type, "restart") == 0)  runRestart(id);
     else if (strcmp(type, "ota") == 0)      runOta(id, params);
     else if (strcmp(type, "rollback") == 0) runRollback(id);
+    else if (strcmp(type, "wifi") == 0)     runWifi(id, params);
     else ack(id, "failed", "unknown command type");
 }
 

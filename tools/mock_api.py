@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS commands (
 );
 """
 
-COMMAND_TYPES = {"status", "config", "geohash", "restart", "ota", "rollback"}
+COMMAND_TYPES = {"status", "config", "geohash", "restart", "ota", "rollback", "wifi"}
 RESEND_AFTER_S = 600  # re-deliver a "sent" command never acked after 10 min
 OFFLINE_AFTER_S = 180
 

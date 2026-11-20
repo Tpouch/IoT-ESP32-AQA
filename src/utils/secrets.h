@@ -55,4 +55,4 @@
 
 // Metadata carried in status payloads.
 #define HARDWARE_VERSION 14
-#define FIRMWARE_VERSION "2.0.0"
+#define FIRMWARE_VERSION "2.1.0"

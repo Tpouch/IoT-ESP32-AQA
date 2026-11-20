@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 
+struct WifiCreds;
+
 class RuntimeConfig {
 public:
     static RuntimeConfig& getInstance() {
@@ -20,6 +22,11 @@ public:
     // twice (e.g. "restart", whose ack may be lost in the reboot) runs once.
     String getLastCommandId() const;
     void setLastCommandId(const char* id);
+
+    // Network set by the "wifi" command; takes precedence over .env at boot.
+    bool getWifiOverride(WifiCreds& out) const;
+    void setWifiOverride(const WifiCreds& creds);
+    void clearWifiOverride();
 
     // Parameters (float key-values from the "config" command)
     bool getParameter(const char* key, float* out) const;
@@ -43,4 +50,5 @@ private:
     static const char* KEY_BOOT_COUNT;
     static const char* KEY_PARAMS_JSON;
     static const char* KEY_LAST_COMMAND;
+    static const char* NVS_WIFI;
 };
