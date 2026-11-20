@@ -17,7 +17,7 @@
 uv installs the dependencies (Textual, plotext, pyserial, PlatformIO) in a
 cached environment on first run. Data comes from the serial log: the firmware
 prints every 15 s frame as
-    [  123.456] [INFO]  frame sent to tele/...: {"t":..,"fields":[{"snd":..},..]}
+    [  123.456] [INFO]  frame queued (3 pending): {"t":..,"age_s":0,"snd":..,"co2":..,..}
 so nothing changes on the device side.
 """
 
@@ -139,7 +139,7 @@ class Telemetry:
 
     def ingest(self, line: str) -> bool:
         """Returns True when the line was a telemetry frame."""
-        if "frame sent to" in line or "frame dropped" in line:
+        if "frame queued" in line or "frame sent to" in line or "frame dropped" in line:
             brace = line.find("{")
             if brace == -1:
                 return False
@@ -147,9 +147,12 @@ class Telemetry:
                 frame = json.loads(line[brace:])
             except ValueError:
                 return False  # truncated line
-            values = {}
-            for field in frame.get("fields", []):
-                values.update(field)
+            if "fields" in frame:  # firmware 1.x: [{"snd":..},{"co2":..},..]
+                values = {}
+                for field in frame["fields"]:
+                    values.update(field)
+            else:                  # firmware 2.x: flat object, null = no reading
+                values = frame
             now = time.time()
             for key, *_ in METRICS:
                 # Keep the series aligned with `times`: a missing field is None.
@@ -157,7 +160,8 @@ class Telemetry:
             self.times.append(now)
             self.last_frame_at = now
             self.stale = bool(frame.get("stale"))
-            self.info["mqtt_frame"] = "envoyée" if "frame sent" in line else "perdue (broker absent)"
+            if m := re.search(r"frame queued \((\d+) pending\)", line):
+                self.info["queue"] = m.group(1)
             return True
 
         if m := re.search(r"firmware (\S+) on", line):
@@ -166,10 +170,24 @@ class Telemetry:
             self.info["co2"] = m.group(1).strip()
         if "self-test |" in line:
             self.info["selftest"] = line.split("self-test |", 1)[1].strip()
-        if m := re.search(r"wifi ip=(\S+) rssi=(-?\d+) dBm mqtt=(\w+)", line):
+        if m := re.search(r"wifi ip=(\S+) rssi=(-?\d+) dBm api=(.+?) queue=(\d+)", line):
+            self.info["wifi"] = f"{m.group(1)} · {m.group(2)} dBm"
+            self.info["api"] = m.group(3)
+            self.info["queue"] = m.group(4)
+        elif m := re.search(r"wifi ip=(\S+) rssi=(-?\d+) dBm mqtt=(\w+)", line):  # firmware 1.x
             self.info["wifi"] = f"{m.group(1)} · {m.group(2)} dBm · mqtt {m.group(3)}"
+        elif m := re.search(r"wifi offline, queue=(\d+)", line):
+            self.info["wifi"] = "hors ligne"
+            self.info["queue"] = m.group(1)
         elif "wifi offline" in line:
             self.info["wifi"] = "hors ligne"
+        if m := re.search(r"api: (\d+) frame\(s\) uploaded, (\d+) pending", line):
+            self.info["api"] = "ok"
+            self.info["queue"] = m.group(2)
+        elif "api: token refused" in line:
+            self.info["api"] = "token refusé"
+        elif re.search(r"api: POST \S+ failed", line):
+            self.info["api"] = "injoignable"
         return False
 
     def series(self, key: str) -> tuple[list[float], list[float]]:
@@ -207,18 +225,21 @@ class DemoBoard:
             yield self.queue.popleft()
         self.k += 1
         k = self.k
-        frame = {"t": int(time.time()), "fields": [
-            {"snd": int(40 + 25 * abs(math.sin(k / 7)) + random.randint(0, 15))},
-            {"co2": int(520 + 180 * math.sin(k / 25) + random.randint(-15, 15))},
-            {"pm25": max(0, int(12 + 8 * math.sin(k / 11) + random.randint(-3, 3)))},
-            {"hum": round(48 + 6 * math.sin(k / 40) + random.random(), 1)},
-            {"temp": round(22.5 + 1.5 * math.sin(k / 50) + random.random() / 3, 1)},
-        ]}
+        frame = {
+            "t": int(time.time()), "age_s": 0,
+            "snd": int(40 + 25 * abs(math.sin(k / 7)) + random.randint(0, 15)),
+            "co2": int(520 + 180 * math.sin(k / 25) + random.randint(-15, 15)),
+            "pm25": max(0, int(12 + 8 * math.sin(k / 11) + random.randint(-3, 3))),
+            "hum": round(48 + 6 * math.sin(k / 40) + random.random(), 1),
+            "temp": round(22.5 + 1.5 * math.sin(k / 50) + random.random() / 3, 1),
+            "stale": False,
+        }
         ts = time.time() - self.t0
-        yield (f"[{ts:9.3f}] [INFO]  frame sent to tele/d347/aqa-DEMO: "
+        yield (f"[{ts:9.3f}] [INFO]  frame queued (1 pending): "
                + json.dumps(frame, separators=(",", ":")))
+        yield f"[{ts:9.3f}] [INFO]  api: 1 frame(s) uploaded, 0 pending"
         if k % 5 == 0:
-            yield f"[{ts:9.3f}] [INFO]  wifi ip=192.168.1.42 rssi=-6{k % 10} dBm mqtt=up"
+            yield f"[{ts:9.3f}] [INFO]  wifi ip=192.168.1.42 rssi=-6{k % 10} dBm api=ok queue=0"
 
 
 # --------------------------------------------------------------------------- widgets
@@ -454,7 +475,8 @@ class AqaMonitor(App):
         t = self.telemetry
         ok = self.serial is not None or self.args.demo
         parts = [Text("● ", style="green" if ok else "red"), Text(self.port_status)]
-        for label, key in (("fw", "fw"), ("CO2", "co2"), ("wifi", "wifi")):
+        for label, key in (("fw", "fw"), ("CO2", "co2"), ("wifi", "wifi"),
+                           ("api", "api"), ("file", "queue")):
             if key in t.info:
                 parts += [Text("   " + label + " ", style="dim"), Text(t.info[key])]
         if t.last_frame_at:

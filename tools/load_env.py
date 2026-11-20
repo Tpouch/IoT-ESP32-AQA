@@ -22,18 +22,18 @@ STRING_KEYS = (
     "WIFI_EAP_IDENTITY",
     "WIFI_EAP_USERNAME",
     "WIFI_EAP_PASSWORD",
-    "MQTT_BROKER",
-    "MQTT_USERNAME",
-    "MQTT_PASSWORD",
+    "API_URL",
+    "DEVICE_TOKEN",
     "GEOHASH_DEFAULT",
-    "FIRMWARE_URL",
-    "FIRMWARE_SIG_URL",
 )
-INT_KEYS = ("MQTT_PORT",)
+INT_KEYS = ()
 
 # Keys whose value is a path (relative to the project root) to a file whose
 # contents become the define: WIFI_EAP_CA_FILE=certs/ca.pem -> WIFI_EAP_CA_PEM.
-FILE_KEYS = {"WIFI_EAP_CA_FILE": "WIFI_EAP_CA_PEM"}
+FILE_KEYS = {
+    "WIFI_EAP_CA_FILE": "WIFI_EAP_CA_PEM",
+    "API_CA_FILE": "API_CA_PEM",
+}
 
 
 def parse_env(path):
@@ -89,7 +89,10 @@ def render(values, project_dir):
     ]
     for key in STRING_KEYS:
         if key in values:
-            lines.append(f"#define {key} {c_string(values[key])}")
+            value = values[key]
+            if key == "API_URL":
+                value = value.rstrip("/")
+            lines.append(f"#define {key} {c_string(value)}")
     for key in INT_KEYS:
         if key in values:
             if not values[key].isdigit():

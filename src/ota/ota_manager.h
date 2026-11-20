@@ -1,44 +1,35 @@
 #pragma once
 
 #include <Arduino.h>
-#include <HTTPClient.h>
-#include <HTTPUpdate.h>
-#include <mbedtls/md.h>
-#include <mbedtls/pk.h>
-#include "network/network_manager.h"
 
-typedef void (*OtaStatusCallback)(const char* commandStatus, int progress);
-
+// Signed OTA. The image is downloaded once: each chunk is hashed (SHA-256)
+// and written to the inactive OTA slot. Only when the RSA signature over that
+// hash verifies against the embedded public key is the slot made bootable;
+// otherwise the write is aborted and the running firmware is untouched.
 class OTAManager {
 public:
+    typedef void (*ProgressFn)(int percent, void* ctx);
+
     static OTAManager& getInstance() {
         static OTAManager instance;
         return instance;
     }
-    
-    void init(const uint8_t* publicKey, size_t keyLen, 
-              const char* firmwareUrl, const char* signatureUrl,
-              const char* statusTopic,
-              OtaStatusCallback onStatus = nullptr);
-    bool performUpdate();
-    bool performUpdateFromMqtt(const char* url, const char* version,
-                              const char* checksum, size_t size);
-    bool performRollback();
-    
+
+    void init(const uint8_t* publicKeyDer, size_t publicKeyLen);
+
+    // https:// URLs are verified against the API trust roots (src/api/tls.h).
+    // On success the caller reboots into the new image.
+    bool install(const char* firmwareUrl, const char* signatureUrl,
+                 String& error, ProgressFn progress = nullptr, void* ctx = nullptr);
+
+    // Boot the other OTA slot if it holds a valid image. Caller reboots.
+    bool rollback(String& error);
+
 private:
-    OTAManager() : publicKey(nullptr), keyLen(0), firmwareUrl(nullptr),
-                  signatureUrl(nullptr), statusTopic(nullptr), onStatus(nullptr) {}
+    OTAManager() = default;
     OTAManager(const OTAManager&) = delete;
     OTAManager& operator=(const OTAManager&) = delete;
-    
-    bool verifySignature(const uint8_t* hash, size_t hashLen, 
-                         const uint8_t* signature, size_t sigLen);
-    void reportOtaStatus(const char* commandStatus, int progress);
 
-    const uint8_t* publicKey;
-    size_t keyLen;
-    const char* firmwareUrl;
-    const char* signatureUrl;
-    const char* statusTopic;
-    OtaStatusCallback onStatus;
-}; 
+    const uint8_t* publicKey = nullptr;
+    size_t keyLen = 0;
+};

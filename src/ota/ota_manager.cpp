@@ -1,349 +1,171 @@
 #include "ota_manager.h"
-#include <esp_ota_ops.h>
-#include <esp_err.h>
+
+#include <HTTPClient.h>
+#include <Update.h>
+#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <esp_task_wdt.h>
+#include <mbedtls/md.h>
+#include <mbedtls/pk.h>
+#include <memory>
 
-// WiFiClient::setTimeout() takes SECONDS on the ESP32 core (the old 60000
-// meant ~17 h per stalled read). Keep it below the 30 s loop watchdog.
-static const uint32_t OTA_READ_TIMEOUT_S = 20;
+#include "api/tls.h"
+#include "utils/logger.h"
 
-void OTAManager::init(const uint8_t* publicKey, size_t keyLen, 
-                     const char* firmwareUrl, const char* signatureUrl,
-                     const char* statusTopic,
-                     OtaStatusCallback onStatus) {
-    this->publicKey = publicKey;
-    this->keyLen = keyLen;
-    this->firmwareUrl = firmwareUrl;
-    this->signatureUrl = signatureUrl;
-    this->statusTopic = statusTopic;
-    this->onStatus = onStatus;
-}
+// WiFiClient::setTimeout() takes SECONDS on the ESP32 core. Keep it below the
+// 30 s loop watchdog, which is also fed between chunks.
+static const uint32_t READ_TIMEOUT_S = 20;
+static const size_t MAX_SIGNATURE_LEN = 1024;
+static const size_t CHUNK = 4096;
 
-void OTAManager::reportOtaStatus(const char* commandStatus, int progress) {
-    if (onStatus) {
-        onStatus(commandStatus, progress);
-    } else if (statusTopic) {
-        NetworkManager::getInstance().publishMessage(statusTopic, commandStatus);
-    }
-}
+namespace {
 
-bool OTAManager::performUpdate() {
-    LOG_I("Checking for updates...");
-    NetworkManager& networkManager = NetworkManager::getInstance();
-    
-    // RAII wrapper for mbedtls contexts
-    class MbedContexts {
-    public:
-        // These are mbedtls context objects that need proper initialization/cleanup
-        mbedtls_pk_context pkContext;     // Public key context
-        mbedtls_md_context_t mdContext;   // Message digest context
-        
-        // Constructor - automatically called when object is created
-        MbedContexts() {
-            mbedtls_pk_init(&pkContext);  // Initialize public key context
-            mbedtls_md_init(&mdContext);  // Initialize message digest context
+// Owns whichever transport the URL needs; must outlive the HTTPClient.
+struct Transport {
+    WiFiClient plain;
+    WiFiClientSecure secure;
+
+    bool begin(HTTPClient& http, const char* url) {
+        if (strncmp(url, "https://", 8) == 0) {
+            configureTls(secure);
+            secure.setTimeout(READ_TIMEOUT_S);
+            return http.begin(secure, url);
         }
-        
-        // Destructor - automatically called when object goes out of scope
-        ~MbedContexts() {
-            mbedtls_md_free(&mdContext);  // Clean up message digest context
-            mbedtls_pk_free(&pkContext);  // Clean up public key context
-        }
-    } contexts;
-
-    // Download signature
-    HTTPClient sigHttp;
-    sigHttp.begin(signatureUrl);
-    sigHttp.setTimeout(30000);
-    int httpCode = sigHttp.GET();
-    if (httpCode != HTTP_CODE_OK) {
-        LOG_E("Failed to download signature");
-        networkManager.publishMessage(statusTopic, "Failed to download signature");
-        return false;
+        plain.setTimeout(READ_TIMEOUT_S);
+        return http.begin(plain, url);
     }
+};
 
-    size_t signatureSize = sigHttp.getSize();
-    std::unique_ptr<uint8_t[]> signature(new uint8_t[signatureSize]);
-    if (!signature) {
-        LOG_E("Failed to allocate signature memory");
-        networkManager.publishMessage(statusTopic, "Memory allocation failed");
-        return false;
-    }
-
-    sigHttp.getStreamPtr()->readBytes(signature.get(), signatureSize);
-    sigHttp.end();
-
-    // Setup crypto contexts
-    if (mbedtls_pk_parse_public_key(&contexts.pkContext, publicKey, keyLen) != 0) {
-        LOG_E("Failed to parse public key");
-        networkManager.publishMessage(statusTopic, "Failed to parse public key");
-        return false;
-    }
-
-    if (mbedtls_md_setup(&contexts.mdContext, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0) != 0) {
-        LOG_E("Failed to setup hash context");
-        networkManager.publishMessage(statusTopic, "Hash setup failed");
-        return false;
-    }
-
-    // Download and verify firmware
-    HTTPClient firmwareHttp;
-    firmwareHttp.begin(firmwareUrl);
-    firmwareHttp.setTimeout(60000);
-    httpCode = firmwareHttp.GET();
-    if (httpCode != HTTP_CODE_OK) {
-        LOG_E("Failed to start firmware download");
-        networkManager.publishMessage(statusTopic, "Firmware download failed");
-        return false;
-    }
-
-    WiFiClient* client = firmwareHttp.getStreamPtr();
-    client->setTimeout(OTA_READ_TIMEOUT_S);
-    const size_t bufSize = 4096;
-    std::unique_ptr<uint8_t[]> buf(new uint8_t[bufSize]);
-    if (!buf) {
-        LOG_E("Failed to allocate buffer");
-        networkManager.publishMessage(statusTopic, "Memory allocation failed");
-        return false;
-    }
-
-    int totalBytes = firmwareHttp.getSize();
-    int remainingBytes = totalBytes;
-    int lastProgress = 0;
-    int maxRetries = 3;
-    unsigned long lastReadTime = 0;
-    unsigned long progressReportInterval = 5000;
-    unsigned long lastProgressReport = 0;
-
-    LOG_I("Starting firmware download (%d bytes)", totalBytes);
-    networkManager.publishMessage(statusTopic, String("Downloading firmware: 0%").c_str());
-
-    mbedtls_md_starts(&contexts.mdContext);
-
-    // Hash the firmware
-    while (remainingBytes > 0) {
-        unsigned long now = millis();
-        int progress = ((totalBytes - remainingBytes) * 100) / totalBytes;
-        if (progress >= lastProgress + 10 || now - lastProgressReport > progressReportInterval) {
-            lastProgress = progress;
-            lastProgressReport = now;
-            LOG_I("Download progress: %d%%", progress);
-            networkManager.publishMessage(statusTopic, String("Downloading firmware: " + String(progress) + "%").c_str());
-            delay(10);
-        }
-
-        size_t bytesToRead = remainingBytes > bufSize ? bufSize : remainingBytes;
-        size_t bytesRead = 0;
-        int retries = 0;
-        
-        while (bytesRead == 0 && retries < maxRetries) {
-            yield();
-            esp_task_wdt_reset();  // a slow download must not trip the loop watchdog
-            bytesRead = client->readBytes(buf.get(), bytesToRead);
-            lastReadTime = millis();
-            
-            if (bytesRead == 0) {
-                retries++;
-                LOG_W("Read retry %d/%d", retries, maxRetries);
-                delay(100 * retries);
-            }
-        }
-        
-        if (bytesRead == 0) {
-            LOG_E("Read timeout after %d retries", maxRetries);
-            networkManager.publishMessage(statusTopic, "Firmware read timeout after retries");
-            return false;
-        }
-
-        mbedtls_md_update(&contexts.mdContext, buf.get(), bytesRead);
-        remainingBytes -= bytesRead;
-    }
-
-    LOG_I("Download complete: 100%%");
-    networkManager.publishMessage(statusTopic, "Download complete");
-    
-    uint8_t hash[32];
-    mbedtls_md_finish(&contexts.mdContext, hash);
-
-    // Verify signature
-    if (mbedtls_pk_verify(&contexts.pkContext, MBEDTLS_MD_SHA256, hash, sizeof(hash), 
-                          signature.get(), signatureSize) != 0) {
-        LOG_E("Signature verification failed");
-        networkManager.publishMessage(statusTopic, "Signature verification failed");
-        return false;
-    }
-
-    firmwareHttp.end();
-    LOG_I("Signature verified successfully");
-    networkManager.publishMessage(statusTopic, "Signature verified");
-
-    // Perform update
-    // httpUpdate opens its own connection. getStreamPtr() on an HTTPClient
-    // that has not sent a request returns nullptr, which used to crash here.
-    WiFiClient updateClient;
-    updateClient.setTimeout(OTA_READ_TIMEOUT_S);
-    httpUpdate.onProgress([](int, int) { esp_task_wdt_reset(); });
-    
-    LOG_I("Starting firmware installation...");
-    networkManager.publishMessage(statusTopic, "Installing firmware");
-    
-    t_httpUpdate_return ret = httpUpdate.update(updateClient, firmwareUrl);
-
-    switch (ret) {
-        case HTTP_UPDATE_FAILED:
-            LOG_E("HTTP_UPDATE_FAILED Error (%d): %s\n", 
-                         httpUpdate.getLastError(),
-                         httpUpdate.getLastErrorString().c_str());
-            networkManager.publishMessage(statusTopic, "OTA update failed");
-            return false;
-
-        case HTTP_UPDATE_NO_UPDATES:
-            LOG_E("HTTP_UPDATE_NO_UPDATES");
-            networkManager.publishMessage(statusTopic, "No updates available");
-            return false;
-
-        case HTTP_UPDATE_OK:
-            LOG_I("HTTP_UPDATE_OK");
-            networkManager.publishMessage(statusTopic, "OTA update successful");
-            return true;
-    }
-    
-    return false;
-}
-
-bool OTAManager::verifySignature(const uint8_t* hash, size_t hashLen, 
-                                const uint8_t* signature, size_t sigLen) {
+struct Crypto {
     mbedtls_pk_context pk;
-    mbedtls_pk_init(&pk);
-    
-    int ret = mbedtls_pk_parse_public_key(&pk, publicKey, keyLen);
-    if (ret != 0) {
-        mbedtls_pk_free(&pk);
-        return false;
-    }
-    
-    ret = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, hashLen, signature, sigLen);
-    mbedtls_pk_free(&pk);
-    
-    return ret == 0;
+    mbedtls_md_context_t md;
+    Crypto() { mbedtls_pk_init(&pk); mbedtls_md_init(&md); }
+    ~Crypto() { mbedtls_md_free(&md); mbedtls_pk_free(&pk); }
+};
+
+}  // namespace
+
+void OTAManager::init(const uint8_t* publicKeyDer, size_t publicKeyLen) {
+    publicKey = publicKeyDer;
+    keyLen = publicKeyLen;
 }
 
-bool OTAManager::performUpdateFromMqtt(const char* url, const char* version,
-                                      const char* checksum, size_t size) {
-    (void)version;
-    (void)checksum;
-    (void)size;
-    if (!url || !url[0]) return false;
-    reportOtaStatus("in_progress", 0);
-
-    class MbedContexts {
-    public:
-        mbedtls_pk_context pkContext;
-        mbedtls_md_context_t mdContext;
-        MbedContexts() {
-            mbedtls_pk_init(&pkContext);
-            mbedtls_md_init(&mdContext);
-        }
-        ~MbedContexts() {
-            mbedtls_md_free(&mdContext);
-            mbedtls_pk_free(&pkContext);
-        }
-    } contexts;
-
-    HTTPClient sigHttp;
-    sigHttp.begin(signatureUrl);
-    sigHttp.setTimeout(30000);
-    int httpCode = sigHttp.GET();
-    if (httpCode != HTTP_CODE_OK) {
-        reportOtaStatus("failed", 0);
-        return false;
-    }
-    size_t signatureSize = sigHttp.getSize();
-    std::unique_ptr<uint8_t[]> signature(new uint8_t[signatureSize]);
-    if (!signature) {
-        reportOtaStatus("failed", 0);
-        return false;
-    }
-    sigHttp.getStreamPtr()->readBytes(signature.get(), signatureSize);
-    sigHttp.end();
-
-    if (mbedtls_pk_parse_public_key(&contexts.pkContext, publicKey, keyLen) != 0 ||
-        mbedtls_md_setup(&contexts.mdContext, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0) != 0) {
-        reportOtaStatus("failed", 0);
+bool OTAManager::install(const char* firmwareUrl, const char* signatureUrl,
+                         String& error, ProgressFn progress, void* ctx) {
+    if (!publicKey || !firmwareUrl || !*firmwareUrl || !signatureUrl || !*signatureUrl) {
+        error = "missing url or public key";
         return false;
     }
 
-    HTTPClient firmwareHttp;
-    firmwareHttp.begin(url);
-    firmwareHttp.setTimeout(60000);
-    httpCode = firmwareHttp.GET();
-    if (httpCode != HTTP_CODE_OK) {
-        reportOtaStatus("failed", 0);
+    Crypto crypto;
+    if (mbedtls_pk_parse_public_key(&crypto.pk, publicKey, keyLen) != 0 ||
+        mbedtls_md_setup(&crypto.md, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0) != 0 ||
+        mbedtls_md_starts(&crypto.md) != 0) {
+        error = "crypto setup failed";
         return false;
     }
-    WiFiClient* client = firmwareHttp.getStreamPtr();
-    client->setTimeout(OTA_READ_TIMEOUT_S);
-    const size_t bufSize = 4096;
-    std::unique_ptr<uint8_t[]> buf(new uint8_t[bufSize]);
-    if (!buf) {
-        reportOtaStatus("failed", 0);
-        return false;
-    }
-    int totalBytes = firmwareHttp.getSize();
-    int remainingBytes = totalBytes;
-    int lastProgress = 0;
-    const int maxRetries = 3;
 
-    mbedtls_md_starts(&contexts.mdContext);
-    while (remainingBytes > 0) {
-        int progress = totalBytes > 0 ? ((totalBytes - remainingBytes) * 100) / totalBytes : 0;
-        if (progress >= lastProgress + 10) {
-            lastProgress = progress;
-            reportOtaStatus("in_progress", progress);
-            delay(10);
-        }
-        size_t bytesToRead = (remainingBytes > bufSize) ? bufSize : remainingBytes;
-        size_t bytesRead = 0;
-        int retries = 0;
-        while (bytesRead == 0 && retries < maxRetries) {
-            yield();
-            esp_task_wdt_reset();  // a slow download must not trip the loop watchdog
-            bytesRead = client->readBytes(buf.get(), bytesToRead);
-            if (bytesRead == 0) { retries++; delay(100 * retries); }
-        }
-        if (bytesRead == 0) {
-            reportOtaStatus("failed", 0);
+    // 1. Signature (small, read fully).
+    uint8_t signature[MAX_SIGNATURE_LEN];
+    size_t signatureLen = 0;
+    {
+        Transport transport;
+        HTTPClient http;
+        if (!transport.begin(http, signatureUrl)) {
+            error = "bad signature url";
             return false;
         }
-        mbedtls_md_update(&contexts.mdContext, buf.get(), bytesRead);
-        remainingBytes -= bytesRead;
+        int code = http.GET();
+        int size = http.getSize();
+        if (code != HTTP_CODE_OK || size <= 0 || size > (int)MAX_SIGNATURE_LEN) {
+            error = String("signature download: http ") + code + ", size " + size;
+            http.end();
+            return false;
+        }
+        signatureLen = http.getStreamPtr()->readBytes(signature, size);
+        http.end();
+        if (signatureLen != (size_t)size) {
+            error = "signature truncated";
+            return false;
+        }
     }
-    reportOtaStatus("in_progress", 100);
-    uint8_t hash[32];
-    mbedtls_md_finish(&contexts.mdContext, hash);
-    if (mbedtls_pk_verify(&contexts.pkContext, MBEDTLS_MD_SHA256, hash, sizeof(hash),
-                          signature.get(), signatureSize) != 0) {
-        reportOtaStatus("failed", 0);
+
+    // 2. Firmware: hash and write in one pass.
+    Transport transport;
+    HTTPClient http;
+    if (!transport.begin(http, firmwareUrl)) {
+        error = "bad firmware url";
         return false;
     }
-    firmwareHttp.end();
-
-    // httpUpdate opens its own connection. getStreamPtr() on an HTTPClient
-    // that has not sent a request returns nullptr, which used to crash here.
-    WiFiClient updateClient;
-    updateClient.setTimeout(OTA_READ_TIMEOUT_S);
-    httpUpdate.onProgress([](int, int) { esp_task_wdt_reset(); });
-    t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
-    firmwareHttp.end();
-    if (ret == HTTP_UPDATE_OK) {
-        reportOtaStatus("completed", 100);
-        return true;
+    int code = http.GET();
+    int total = http.getSize();
+    if (code != HTTP_CODE_OK || total <= 0) {
+        error = String("firmware download: http ") + code + ", size " + total;
+        http.end();
+        return false;
     }
-    reportOtaStatus("failed", 0);
-    return false;
+    if (!Update.begin(total, U_FLASH)) {
+        error = String("no room for image: ") + Update.errorString();
+        http.end();
+        return false;
+    }
+
+    LOG_I("OTA: downloading %d bytes", total);
+    std::unique_ptr<uint8_t[]> buf(new uint8_t[CHUNK]);
+    WiFiClient* stream = http.getStreamPtr();
+    int remaining = total;
+    int lastReported = -1;
+    while (remaining > 0) {
+        esp_task_wdt_reset();
+        size_t want = remaining < (int)CHUNK ? remaining : CHUNK;
+        size_t got = stream->readBytes(buf.get(), want);
+        if (got == 0) {
+            error = "download stalled";
+            Update.abort();
+            http.end();
+            return false;
+        }
+        mbedtls_md_update(&crypto.md, buf.get(), got);
+        if (Update.write(buf.get(), got) != got) {
+            error = String("flash write: ") + Update.errorString();
+            Update.abort();
+            http.end();
+            return false;
+        }
+        remaining -= got;
+        int percent = (int)(100LL * (total - remaining) / total);
+        if (progress && percent / 25 != lastReported / 25) {
+            lastReported = percent;
+            progress(percent, ctx);
+        }
+    }
+    http.end();
+
+    // 3. Verify before the slot becomes bootable.
+    uint8_t hash[32];
+    mbedtls_md_finish(&crypto.md, hash);
+    if (mbedtls_pk_verify(&crypto.pk, MBEDTLS_MD_SHA256, hash, sizeof(hash),
+                          signature, signatureLen) != 0) {
+        error = "signature verification failed";
+        Update.abort();
+        return false;
+    }
+    if (!Update.end()) {
+        error = String("finalise: ") + Update.errorString();
+        return false;
+    }
+    LOG_I("OTA: signature verified, new image will boot after restart");
+    return true;
 }
 
-bool OTAManager::performRollback() {
-    esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
-    return (err == ESP_OK);
-} 
+bool OTAManager::rollback(String& error) {
+    if (!Update.canRollBack()) {
+        error = "no valid previous image";
+        return false;
+    }
+    if (!Update.rollBack()) {
+        error = "could not switch boot partition";
+        return false;
+    }
+    return true;
+}

@@ -12,3 +12,6 @@ tools/keys/
 # Exports from tools/aqa_tui.py
 aqa-*.csv
 __pycache__/
+
+# tools/mock_api.py database
+aqa-mock.sqlite3

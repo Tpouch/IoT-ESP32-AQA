@@ -12,12 +12,16 @@ public:
 
     void begin();
 
-    // Geohash (for tele topic: tele/{geohash}/{sensor_id})
+    // Geohash of the node's location, sent with every frame batch.
     String getGeohash() const;
     void setGeohash(const char* geohash);
-    String getTeleTopic() const;
 
-    // Parameters (float key-values from cmd/config)
+    // Last command id executed, persisted so a command the server delivers
+    // twice (e.g. "restart", whose ack may be lost in the reboot) runs once.
+    String getLastCommandId() const;
+    void setLastCommandId(const char* id);
+
+    // Parameters (float key-values from the "config" command)
     bool getParameter(const char* key, float* out) const;
     void setParameter(const char* key, float value);
     void setParametersFromJson(JsonObject params);
@@ -38,4 +42,5 @@ private:
     static const char* KEY_GEOHASH;
     static const char* KEY_BOOT_COUNT;
     static const char* KEY_PARAMS_JSON;
+    static const char* KEY_LAST_COMMAND;
 };

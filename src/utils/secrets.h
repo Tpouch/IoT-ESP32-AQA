@@ -6,7 +6,7 @@
 //
 //     cp .env.example .env    # then edit .env
 //
-// Never commit a real password or a private key.
+// Never commit a real password, token or private key.
 
 #if __has_include("env_secrets.h")
 #include "env_secrets.h"
@@ -35,19 +35,17 @@
 // WIFI_EAP_CA_PEM (from WIFI_EAP_CA_FILE in .env) is optional; without it the
 // RADIUS server's certificate is not checked.
 
-// MQTT broker for the local Mosquitto instance. Port 1883 is plaintext.
-#ifndef MQTT_BROKER
-#define MQTT_BROKER "192.168.1.10"
+// HTTPS API the node reports to (see docs/api.md). No trailing slash.
+#ifndef API_URL
+#define API_URL "https://sensor.devgoblin.fr"
 #endif
-#ifndef MQTT_PORT
-#define MQTT_PORT 1883
+// Per-device secret sent as "Authorization: Bearer <token>". Empty = the
+// server will answer 401 and nothing is stored.
+#ifndef DEVICE_TOKEN
+#define DEVICE_TOKEN ""
 #endif
-#ifndef MQTT_USERNAME
-#define MQTT_USERNAME "student"
-#endif
-#ifndef MQTT_PASSWORD
-#define MQTT_PASSWORD "student"
-#endif
+// API_CA_PEM (from API_CA_FILE in .env) overrides the built-in root bundle in
+// src/api/ca_roots.h, e.g. for a self-hosted server with a private CA.
 
 // Identity and location defaults (Medellín, for the course).
 #define SENSOR_PREFIX "aqa-"
@@ -55,12 +53,6 @@
 #define GEOHASH_DEFAULT "d347"
 #endif
 
-// Metadata carried in status payloads; used by the OTA stage too.
+// Metadata carried in status payloads.
 #define HARDWARE_VERSION 14
-#define FIRMWARE_VERSION "1.0.0"
-#ifndef FIRMWARE_URL
-#define FIRMWARE_URL "http://192.168.1.10:8000/firmware.bin"
-#endif
-#ifndef FIRMWARE_SIG_URL
-#define FIRMWARE_SIG_URL "http://192.168.1.10:8000/firmware.sig"
-#endif
+#define FIRMWARE_VERSION "2.0.0"

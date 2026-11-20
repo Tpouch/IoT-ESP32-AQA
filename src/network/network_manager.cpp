@@ -1,6 +1,5 @@
 #include "network_manager.h"
 
-#include "utils/config_manager.h"
 #include "utils/secrets.h"
 
 String NetworkManager::generateDeviceID() {
@@ -63,7 +62,7 @@ bool NetworkManager::initWiFi(int portalTimeoutSeconds) {
     if (connectWithSecrets(15000)) {
         LOG_I("WiFi connected ip=%s rssi=%d dBm", ip().c_str(), (int)rssi());
         wifiReconnectCount = 0;
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        startNtp();
         return true;
     }
 
@@ -71,96 +70,12 @@ bool NetworkManager::initWiFi(int portalTimeoutSeconds) {
         LOG_I("WiFi connected via portal ip=%s rssi=%d dBm",
               ip().c_str(), (int)rssi());
         wifiReconnectCount = 0;
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        startNtp();
         return true;
     }
 
     LOG_E("WiFi unavailable; sampling continues offline");
     return false;
-}
-
-bool NetworkManager::initMQTT(const char* broker, int port,
-                              const char* username, const char* password) {
-    mqttBroker = broker;
-    mqttPort = port;
-    mqttUsername = username;
-    mqttPassword = password;
-
-    mqttClient.setServer(broker, port);
-
-    // Status payloads carry parameters and command state and can exceed the
-    // 256-byte PubSubClient default, in which case publish() fails silently.
-    mqttClient.setBufferSize(1024);
-
-    return reconnectMQTT();
-}
-
-bool NetworkManager::reconnectMQTT() {
-    if (mqttClient.connected() || mqttBroker == nullptr) {
-        return mqttClient.connected();
-    }
-
-    String clientId = Config().getSensorId();
-    String statusTopic = Config().getStaTopic();
-    String willPayload = String("{\"sensor_id\":\"") + Config().getSensorId() +
-                         "\",\"online\":false}";
-
-    LOG_I("MQTT connect %s:%d as %s", mqttBroker, mqttPort, clientId.c_str());
-
-    // Last Will: retained so a dead node leaves an offline marker behind.
-    // The broker publishes it when the keep-alive window expires — no clean
-    // disconnect required, which is exactly the failure mode of a power cut.
-    bool connected;
-    if (mqttUsername != nullptr && mqttPassword != nullptr) {
-        connected = mqttClient.connect(clientId.c_str(), mqttUsername, mqttPassword,
-                                       statusTopic.c_str(), 1, true, willPayload.c_str());
-    } else {
-        connected = mqttClient.connect(clientId.c_str(), nullptr, nullptr,
-                                       statusTopic.c_str(), 1, true, willPayload.c_str());
-    }
-
-    if (connected) {
-        LOG_I("MQTT connected");
-        mqttReconnectCount = 0;
-        return true;
-    }
-
-    mqttReconnectCount++;
-    LOG_W("MQTT connect failed rc=%d (attempt %d)",
-          mqttClient.state(), mqttReconnectCount);
-    return false;
-}
-
-void NetworkManager::setCallback(void (*callback)(char*, byte*, unsigned int)) {
-    mqttClient.setCallback(callback);
-}
-
-bool NetworkManager::subscribe(const char* topic, uint8_t qos) {
-    if (!mqttClient.connected()) {
-        LOG_W("cannot subscribe to %s: MQTT disconnected", topic);
-        return false;
-    }
-    bool ok = mqttClient.subscribe(topic, qos);
-    if (ok) {
-        LOG_I("subscribed %s (QoS %d)", topic, qos);
-    } else {
-        LOG_E("subscribe failed: %s", topic);
-    }
-    return ok;
-}
-
-bool NetworkManager::publishMessage(const char* topic, const char* payload, bool retained) {
-    if (!mqttClient.connected()) {
-        LOG_W("cannot publish to %s: MQTT disconnected", topic);
-        return false;
-    }
-    bool ok = mqttClient.publish(topic, payload, retained);
-    if (ok) {
-        LOG_D("published %s: %s", topic, payload);
-    } else {
-        LOG_E("publish failed: %s", topic);
-    }
-    return ok;
 }
 
 void NetworkManager::loop() {
@@ -181,6 +96,7 @@ void NetworkManager::loop() {
                 LOG_I("WiFi reconnected ip=%s rssi=%d dBm",
                       ip().c_str(), (int)rssi());
                 wifiReconnectCount = 0;
+                startNtp();
             } else {
                 wifiReconnectCount++;
                 if (wifiReconnectCount >= MAX_WIFI_RETRIES) {
@@ -189,19 +105,18 @@ void NetworkManager::loop() {
                 }
             }
         }
-        return;
     }
+}
 
-    if (!mqttClient.connected()) {
-        unsigned long now = millis();
-        if (now - lastReconnectAttempt >= MQTT_RECONNECT_INTERVAL) {
-            lastReconnectAttempt = now;
-            if (reconnectMQTT()) {
-                lastReconnectAttempt = 0;
-            }
-        }
-        return;
-    }
+void NetworkManager::startNtp() {
+    // Once is enough: SNTP keeps resyncing in the background. Doing it on the
+    // first successful join (not only at boot) covers a node that boots
+    // offline and gets Wi-Fi later.
+    if (ntpStarted) return;
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    ntpStarted = true;
+}
 
-    mqttClient.loop();
+bool NetworkManager::timeSynced() {
+    return time(nullptr) > 1600000000L;
 }

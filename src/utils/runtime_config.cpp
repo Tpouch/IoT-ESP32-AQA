@@ -1,5 +1,4 @@
 #include "runtime_config.h"
-#include "config_manager.h"
 #include "secrets.h"
 #include <Preferences.h>
 
@@ -8,6 +7,7 @@ const char* RuntimeConfig::NVS_PARAMS = "params";
 const char* RuntimeConfig::KEY_GEOHASH = "geohash";
 const char* RuntimeConfig::KEY_BOOT_COUNT = "boot_count";
 const char* RuntimeConfig::KEY_PARAMS_JSON = "p";
+const char* RuntimeConfig::KEY_LAST_COMMAND = "last_cmd";
 
 void RuntimeConfig::begin() {
     incrementBootCount();
@@ -31,10 +31,20 @@ void RuntimeConfig::setGeohash(const char* geohash) {
     prefs.end();
 }
 
-String RuntimeConfig::getTeleTopic() const {
-    String g = getGeohash();
-    const char* sid = Config().getSensorId();
-    return String("tele/") + g + "/" + sid;
+String RuntimeConfig::getLastCommandId() const {
+    Preferences prefs;
+    if (!prefs.begin(NVS_DEVICE, true)) return String();
+    String id = prefs.isKey(KEY_LAST_COMMAND) ? prefs.getString(KEY_LAST_COMMAND, "") : String();
+    prefs.end();
+    return id;
+}
+
+void RuntimeConfig::setLastCommandId(const char* id) {
+    if (!id) return;
+    Preferences prefs;
+    if (!prefs.begin(NVS_DEVICE, false)) return;
+    prefs.putString(KEY_LAST_COMMAND, id);
+    prefs.end();
 }
 
 bool RuntimeConfig::getParameter(const char* key, float* out) const {
@@ -44,10 +54,10 @@ bool RuntimeConfig::getParameter(const char* key, float* out) const {
     if (!prefs.isKey(KEY_PARAMS_JSON)) { prefs.end(); return false; }
     String json = prefs.getString(KEY_PARAMS_JSON, "{}");
     prefs.end();
-    DynamicJsonDocument doc(512);
+    JsonDocument doc;
     if (deserializeJson(doc, json) != DeserializationError::Ok) return false;
     JsonObject o = doc.as<JsonObject>();
-    if (!o.containsKey(key)) return false;
+    if (!o[key].is<float>()) return false;
     *out = o[key].as<float>();
     return true;
 }
@@ -56,7 +66,7 @@ void RuntimeConfig::setParameter(const char* key, float value) {
     Preferences prefs;
     if (!prefs.begin(NVS_PARAMS, false)) return;
     String json = prefs.isKey(KEY_PARAMS_JSON) ? prefs.getString(KEY_PARAMS_JSON, "{}") : String("{}");
-    DynamicJsonDocument doc(512);
+    JsonDocument doc;
     deserializeJson(doc, json);
     doc[key] = value;
     String out;
@@ -69,7 +79,7 @@ void RuntimeConfig::setParametersFromJson(JsonObject params) {
     Preferences prefs;
     if (!prefs.begin(NVS_PARAMS, false)) return;
     String json = prefs.isKey(KEY_PARAMS_JSON) ? prefs.getString(KEY_PARAMS_JSON, "{}") : String("{}");
-    DynamicJsonDocument doc(512);
+    JsonDocument doc;
     deserializeJson(doc, json);
     JsonObject o = doc.as<JsonObject>();
     for (JsonPair kv : params) {
@@ -89,7 +99,7 @@ void RuntimeConfig::getParametersJson(JsonObject out) const {
     if (!prefs.isKey(KEY_PARAMS_JSON)) { prefs.end(); return; }
     String json = prefs.getString(KEY_PARAMS_JSON, "{}");
     prefs.end();
-    DynamicJsonDocument doc(512);
+    JsonDocument doc;
     if (deserializeJson(doc, json) != DeserializationError::Ok) return;
     for (JsonPair kv : doc.as<JsonObject>())
         out[kv.key()] = kv.value().as<float>();

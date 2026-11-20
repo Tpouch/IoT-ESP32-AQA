@@ -9,9 +9,7 @@
 #include <TaskScheduler.h>
 
 #include "hal/hal.h"
-
-// Remove the global taskRunner declaration
-// Scheduler taskRunner;
+#include "api/frame_queue.h"
 
 class DataManager {
 public:
@@ -20,7 +18,8 @@ public:
         return instance;
     }
     
-    void init(HAL& hal, Scheduler& scheduler);
+    // Frames are pushed into `queue`; the API client drains it.
+    void init(HAL& hal, Scheduler& scheduler, FrameQueue& queue);
     void setupTasks();
     void loop();
     
@@ -36,31 +35,25 @@ private:
     static void htSampleCallback();
     static void sendDataFrameCallback();
     
-    // Methods to calculate averages
-    unsigned short int getSoundSamplesAverage();
-    unsigned short int getPmSamplesAverage();
-    unsigned short int getCo2SamplesAverage();
+    // Mean of a sample window, then clears it. False when the window is empty.
+    static bool takeAverage(std::vector<unsigned int>& samples, uint16_t& out);
     void createDataFrame();
-    
+
     // Data storage
     std::vector<unsigned int> soundSamples;
     std::vector<unsigned int> pm25Samples;
     std::vector<unsigned int> co2Samples;
     float humidity;
     float temperature;
+    bool haveHumTemp = false;
 
     // Frozen-value detection (S12 reliability baseline).
-    unsigned short lastSound = 0;
-    unsigned short lastCo2 = 0;
-    unsigned short lastPm25 = 0;
-    unsigned short lastHum10 = 0;
-    unsigned short lastTemp10 = 0;
+    Frame lastFrame;
     bool haveLastFrame = false;
     unsigned int frozenFrames = 0;
-    
-    // JSON document for MQTT
-    DynamicJsonDocument dataDoc;
-    
+
+    FrameQueue* queue = nullptr;
+
     // Task scheduler
     Scheduler* scheduler;
     

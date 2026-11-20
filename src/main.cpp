@@ -1,48 +1,32 @@
 #include <Arduino.h>
 #include <esp_task_wdt.h>
 
+#include "api/api_client.h"
+#include "api/frame_queue.h"
 #include "data/data_manager.h"
 #include "hal/hal.h"
-#include "mqtt/mqtt_protocol.h"
 #include "network/network_manager.h"
 #include "ota/ota_manager.h"
 #include "public_key.h"
 #include "utils/config_manager.h"
 #include "utils/logger.h"
+#include "utils/runtime_config.h"
 #include "utils/secrets.h"
 #include "utils/task_manager.h"
 
-// Stage v1.0-ota
-//
-// Goal: the device updates itself without trusting the network. Signed OTA is
-// the last gap between this ladder and the production firmware.
-//
-// Lesson: a public key in firmware turns an update into a verification problem.
-// `cmd/ota` delivers {url, version, checksum, size}; the image is downloaded,
-// hashed and checked with mbedtls_pk_verify before httpUpdate may commit it.
-// A bad signature leaves the running application untouched; cmd/rollback
-// returns to the previous slot.
-//
-// Everything from v0.13 stays: NTP timestamps, retained Last Will, watchdog,
-// stale flag and decimal precision.
+// Sensors are sampled by TaskScheduler into 15 s windows; each window becomes
+// a Frame in an in-RAM queue (6 h deep). The API client drains the queue over
+// HTTPS in batches and runs the commands the server returns. See docs/api.md.
 
 static const int HEARTBEAT_LED = LED_BUILTIN;
-static const unsigned long STATUS_INTERVAL_MS = 10000;
-static const unsigned long HEARTBEAT_INTERVAL_MS = 60000;
+static const unsigned long STATUS_LOG_INTERVAL_MS = 10000;
 
 static HAL& hal = HAL::getInstance();
 static NetworkManager& network = NetworkManager::getInstance();
-static MqttProtocol& mqtt = MqttProtocol::getInstance();
+static ApiClient& api = ApiClient::getInstance();
+static FrameQueue frameQueue;
 
 static const char* ok(bool value) { return value ? "PASS" : "FAIL"; }
-
-static void mqttCallback(char* topic, byte* payload, unsigned int length) {
-    mqtt.handleMqttMessage(topic, payload, length);
-}
-
-static void otaStatusCallback(const char* commandStatus, int progress) {
-    mqtt.publishStatus("ota", commandStatus, progress);
-}
 
 void setup() {
     Logger::getInstance().begin(115200, LOG_INFO);
@@ -50,17 +34,13 @@ void setup() {
 
     LOG_I("firmware %s on %s", FIRMWARE_VERSION, ARDUINO_BOARD);
 
-    String deviceId = network.generateDeviceID();
-    Config().init(deviceId);
-    LOG_I("sensor id %s, tele topic %s",
-          Config().getSensorId(), Config().getDataTopic());
-
-    mqtt.begin();  // loads boot count, subscribes nothing until connected
+    Config().init(network.generateDeviceID());
+    RuntimeConfig::getInstance().begin();  // boot count
+    LOG_I("sensor id %s", Config().getSensorId());
 
     if (!hal.init()) {
         LOG_W("some sensors failed to initialise; continuing with the rest");
     }
-
     LOG_I("self-test | temperature %s | co2 %s | pm %s | sound %s",
           ok(hal.isSensorInitialized(SENSOR_TEMPERATURE)),
           ok(hal.isSensorInitialized(SENSOR_CO2)),
@@ -68,39 +48,23 @@ void setup() {
           ok(hal.isSensorInitialized(SENSOR_SOUND)));
 
     network.initWiFi();
-    network.setCallback(mqttCallback);
-
-    if (network.initMQTT(Config().getMqttBroker(), Config().getMqttPort(),
-                         Config().getMqttUsername(), Config().getMqttPassword())) {
-        mqtt.subscribeCommandTopics();
-        mqtt.publishStatus("", "", 0);
-    } else {
-        LOG_W("broker unreachable now; loop() will keep retrying");
-    }
 
     TaskManager::getInstance().init();
-    DataManager::getInstance().init(hal, TaskManager::getInstance().getScheduler());
+    DataManager::getInstance().init(hal, TaskManager::getInstance().getScheduler(), frameQueue);
 
-    // OTA: the public key verifies, the private key signs off-device. A tampered
-    // image is rejected before it can be committed.
-    OTAManager::getInstance().init(
-        public_key_der, public_key_der_len,
-        Config().getFirmwareUrl(), Config().getFirmwareSigUrl(),
-        Config().getStaTopic(), otaStatusCallback);
+    OTAManager::getInstance().init(public_key_der, public_key_der_len);
+    api.begin(frameQueue);
 
-    // Watchdog: if the loop stops feeding it for 30 s, the board reboots. The
-    // failure mode this catches is a hung driver or a blocked loop, not a
-    // long-running task — those must yield.
+    // Watchdog: if the loop stops feeding it for 30 s, the board reboots. Long
+    // operations (TLS handshakes, OTA download) feed it or stay under that.
     esp_task_wdt_init(30, true);
     esp_task_wdt_add(NULL);
 }
 
 void loop() {
     static unsigned long lastBlink = 0;
-    static unsigned long lastStatus = 0;
-    static unsigned long lastHeartbeat = 0;
+    static unsigned long lastStatusLog = 0;
     static bool ledOn = false;
-    static bool mqttWasConnected = false;
 
     unsigned long now = millis();
 
@@ -111,32 +75,21 @@ void loop() {
     }
 
     network.loop();
-
-    bool mqttConnected = network.isConnected();
-    if (mqttConnected && !mqttWasConnected) {
-        // Re-subscribe on every reconnect: subscriptions do not survive a session.
-        mqtt.subscribeCommandTopics();
-        mqtt.publishStatus("", "", 0);
-    }
-    mqttWasConnected = mqttConnected;
-
-    if (mqttConnected && now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
-        lastHeartbeat = now;
-        mqtt.publishStatus("", "", 0);
-    }
-
-    if (now - lastStatus >= STATUS_INTERVAL_MS) {
-        lastStatus = now;
-        if (network.isWifiConnected()) {
-            LOG_I("wifi ip=%s rssi=%d dBm mqtt=%s",
-                  network.ip().c_str(), (int)network.rssi(),
-                  mqttConnected ? "up" : "down");
-        } else {
-            LOG_W("wifi offline");
-        }
-    }
-
     TaskManager::getInstance().execute();
     hal.update();
     esp_task_wdt_reset();
+
+    api.loop();  // at most one HTTPS request per iteration
+    esp_task_wdt_reset();
+
+    if (now - lastStatusLog >= STATUS_LOG_INTERVAL_MS) {
+        lastStatusLog = now;
+        if (network.isWifiConnected()) {
+            LOG_I("wifi ip=%s rssi=%d dBm api=%s queue=%u",
+                  network.ip().c_str(), (int)network.rssi(), api.state(),
+                  (unsigned)frameQueue.size());
+        } else {
+            LOG_W("wifi offline, queue=%u", (unsigned)frameQueue.size());
+        }
+    }
 }

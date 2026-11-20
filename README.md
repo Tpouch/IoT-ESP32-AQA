@@ -40,10 +40,10 @@ board, `s` exports the history to `aqa-<date>.csv`.
 
 ## Secrets (`.env`)
 
-Wi-Fi, MQTT and OTA settings come from a gitignored `.env` at the project root:
+Wi-Fi and API settings come from a gitignored `.env` at the project root:
 
 ```bash
-cp .env.example .env     # then set WIFI_SSID / WIFI_PASSWORD (and MQTT_* if needed)
+cp .env.example .env     # then set WIFI_* and DEVICE_TOKEN
 pio run -e ttgo-t7-v14-mini32 --target upload
 ```
 
@@ -53,6 +53,23 @@ generated header (`.pio/build/<env>/generated/env_secrets.h`), which
 `secrets.h`, so the project still builds as cloned. Changing `.env` triggers a
 rebuild; the build log lists which keys were loaded, never their values.
 Never commit `.env` or a private key.
+
+## HTTPS API (firmware 2.x)
+
+The node no longer uses MQTT. Every 15 s frame goes into a 6 h in-RAM queue
+and is uploaded over HTTPS (`POST /api/v1/devices/{id}/frames`, batches of up
+to 20); a status heartbeat goes out every 60 s. Commands (status, config,
+geohash, restart, signed OTA, rollback) come back in the responses and are
+acknowledged on their own route. The full contract, with payloads, error
+handling and a suggested database schema, is in [docs/api.md](docs/api.md).
+
+```bash
+python3 tools/mock_api.py --token dev-token   # local reference server on :8000
+python3 tools/update_ca_roots.py              # refresh src/api/ca_roots.h
+```
+
+The stage-by-stage sections below describe the course ladder (v0.x/v1.0),
+which used MQTT.
 
 WPA2-Enterprise networks (802.1X, PEAP + MSCHAPv2: eduroam, student
 residences) use `WIFI_EAP_USERNAME` / `WIFI_EAP_PASSWORD` instead of

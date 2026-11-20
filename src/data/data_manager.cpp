@@ -1,6 +1,5 @@
 #include "data_manager.h"
 #include "network/network_manager.h"
-#include "utils/runtime_config.h"
 #include "utils/task_manager.h"
 
 #include <time.h>
@@ -8,8 +7,7 @@
 // Initialize static member
 DataManager* DataManager::instance = nullptr;
 
-DataManager::DataManager() : 
-    dataDoc(2048),
+DataManager::DataManager() :
     scheduler(nullptr),
     hal(nullptr),
     humidity(0),
@@ -18,9 +16,10 @@ DataManager::DataManager() :
     instance = this;
 }
 
-void DataManager::init(HAL& halInstance, Scheduler& taskRunner) {
+void DataManager::init(HAL& halInstance, Scheduler& taskRunner, FrameQueue& frameQueue) {
     hal = &halInstance;
     scheduler = &taskRunner;
+    queue = &frameQueue;
     setupTasks();
 }
 
@@ -101,6 +100,7 @@ void DataManager::htSampleCallback() {
                 // loses 0.1 C and 0.1 %RH on every frame.
                 instance->temperature = temp;
                 instance->humidity = humidity;
+                instance->haveHumTemp = true;
                 LOG_D("Temperature: %.1f°C, Humidity: %.1f%%", temp, humidity);
             } else {
                 LOG_W("Temperature sensor read failed after retries");
@@ -117,87 +117,57 @@ void DataManager::sendDataFrameCallback() {
     }
 }
 
-unsigned short int DataManager::getSoundSamplesAverage() {
-    if (soundSamples.empty()) return 0;
-    
-    unsigned short int average = std::accumulate(soundSamples.begin(), soundSamples.end(), 0.0) / soundSamples.size();
-    soundSamples.clear();
-    return average;
-}
-
-unsigned short int DataManager::getPmSamplesAverage() {
-    if (pm25Samples.empty()) return 0;
-    
-    unsigned short int average = std::accumulate(pm25Samples.begin(), pm25Samples.end(), 0.0) / pm25Samples.size();
-    pm25Samples.clear();
-    return average;
-}
-
-unsigned short int DataManager::getCo2SamplesAverage() {
-    if (co2Samples.empty()) return 0;
-    
-    unsigned short int average = std::accumulate(co2Samples.begin(), co2Samples.end(), 0.0) / co2Samples.size();
-    co2Samples.clear();
-    return average;
+bool DataManager::takeAverage(std::vector<unsigned int>& samples, uint16_t& out) {
+    if (samples.empty()) return false;
+    double mean = std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
+    samples.clear();
+    out = (uint16_t)lround(mean);
+    return true;
 }
 
 void DataManager::createDataFrame() {
-    unsigned short int avgSound = getSoundSamplesAverage();
-    unsigned short int avgCO2 = getCo2SamplesAverage();
-    unsigned short int avgPM25 = getPmSamplesAverage();
+    // Sound, PM and CO2 are means over the 15 s window; temperature and
+    // humidity are the latest reading (one sample per window). A sensor with
+    // no sample in the window is sent as null, never as 0.
+    Frame frame;
+    frame.capturedAtMs = millis();
+    if (NetworkManager::timeSynced()) {
+        frame.epoch = (uint32_t)time(nullptr);
+    }
+    bool any = false;
+    any |= takeAverage(soundSamples, frame.snd);
+    any |= takeAverage(co2Samples, frame.co2);
+    any |= takeAverage(pm25Samples, frame.pm25);
+    if (haveHumTemp) {
+        frame.hum10 = (int16_t)lroundf(humidity * 10.0f);
+        frame.temp10 = (int16_t)lroundf(temperature * 10.0f);
+        any = true;
+    }
 
-    // Metrology fix (S6+7 audit): sound, PM and CO2 are windowed averages and
-    // humidity/temperature now keep their decimal precision instead of being
-    // truncated to integers. A frame that stays identical for three rounds is
-    // flagged as stale rather than published as fresh data.
-    // Measurement time, not delivery time. Zero until NTP answers.
-    long epoch = (long)time(nullptr);
-    dataDoc["t"] = epoch > 1600000000L ? epoch : 0;
-
-    // Frozen-value detection: identical quantised readings for three frames in a
-    // row are suspicious (stuck driver, unplugged sensor returning last value).
-    unsigned short qSound = avgSound;
-    unsigned short qCo2 = avgCO2;
-    unsigned short qPm25 = avgPM25;
-    unsigned short qHum10 = (unsigned short)(humidity * 10.0f);
-    unsigned short qTemp10 = (unsigned short)(temperature * 10.0f);
-
+    // Frozen-value detection: identical readings for three frames in a row
+    // are suspicious (stuck driver, unplugged sensor returning last value).
     bool frozen = haveLastFrame &&
-                  qSound == lastSound && qCo2 == lastCo2 && qPm25 == lastPm25 &&
-                  qHum10 == lastHum10 && qTemp10 == lastTemp10;
+                  frame.snd == lastFrame.snd && frame.co2 == lastFrame.co2 &&
+                  frame.pm25 == lastFrame.pm25 && frame.hum10 == lastFrame.hum10 &&
+                  frame.temp10 == lastFrame.temp10;
     frozenFrames = frozen ? frozenFrames + 1 : 0;
-
-    lastSound = qSound;
-    lastCo2 = qCo2;
-    lastPm25 = qPm25;
-    lastHum10 = qHum10;
-    lastTemp10 = qTemp10;
-    haveLastFrame = true;
-
-    dataDoc["fields"][0]["snd"] = avgSound;
-    dataDoc["fields"][1]["co2"] = avgCO2;
-    dataDoc["fields"][2]["pm25"] = avgPM25;
-    dataDoc["fields"][3]["hum"] = round(humidity * 10.0f) / 10.0f;
-    dataDoc["fields"][4]["temp"] = round(temperature * 10.0f) / 10.0f;
-
-    if (frozenFrames >= 2) {
-        dataDoc["stale"] = true;
+    frame.stale = frozenFrames >= 2;
+    if (frame.stale) {
         LOG_W("values unchanged for %u frames; flagging stale", frozenFrames + 1);
     }
+    lastFrame = frame;
+    haveLastFrame = true;
 
-    String dataString;
-    serializeJson(dataDoc, dataString);
-
-    // RuntimeConfig reads the geohash from NVS, so cmd/geohash can move the node
-    // without reflashing; the default comes from secrets.h.
-    String teleTopic = RuntimeConfig::getInstance().getTeleTopic();
-    if (NetworkManager::getInstance().publishMessage(teleTopic.c_str(), dataString.c_str())) {
-        LOG_I("frame sent to %s: %s", teleTopic.c_str(), dataString.c_str());
-    } else {
-        LOG_E("frame dropped (no broker) %s", dataString.c_str());
+    if (!any) {
+        LOG_W("frame built with no samples from any sensor");
     }
 
-    if (soundSamples.empty() && pm25Samples.empty() && co2Samples.empty()) {
-        LOG_W("frame built with no samples in any window");
-    }
-} 
+    queue->push(frame);
+
+    // Same JSON as sent to the API; tools/aqa_tui.py parses this line.
+    JsonDocument doc;
+    frame.toJson(doc.to<JsonObject>(), frame.capturedAtMs);
+    String json;
+    serializeJson(doc, json);
+    LOG_I("frame queued (%u pending): %s", (unsigned)queue->size(), json.c_str());
+}
