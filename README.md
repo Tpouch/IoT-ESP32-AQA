@@ -39,6 +39,13 @@ generated header (`.pio/build/<env>/generated/env_secrets.h`), which
 rebuild; the build log lists which keys were loaded, never their values.
 Never commit `.env` or a private key.
 
+WPA2-Enterprise networks (802.1X, PEAP + MSCHAPv2: eduroam, student
+residences) use `WIFI_EAP_USERNAME` / `WIFI_EAP_PASSWORD` instead of
+`WIFI_PASSWORD`; see `.env.example`. Point `WIFI_EAP_CA_FILE` at the network's
+CA certificate (PEM) so the board checks it is talking to the real RADIUS
+server; without it, a rogue access point with the same SSID can collect the
+MSCHAPv2 exchange.
+
 ## Stage 00 — `v0.0-toolchain`
 
 Nothing but the toolchain. The firmware prints a banner with its compile time and

@@ -19,9 +19,26 @@ bool NetworkManager::connectWithSecrets(unsigned long timeoutMs) {
         return false;
     }
 
-    LOG_I("connecting to SSID %s", WIFI_SSID);
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    if (strlen(WIFI_EAP_USERNAME) > 0) {
+        // WPA2-Enterprise, PEAP outer tunnel, MSCHAPv2 inside (the IDF default).
+        const char* identity = strlen(WIFI_EAP_IDENTITY) > 0 ? WIFI_EAP_IDENTITY
+                                                             : WIFI_EAP_USERNAME;
+#ifdef WIFI_EAP_CA_PEM
+        const char* caPem = WIFI_EAP_CA_PEM;
+#else
+        const char* caPem = nullptr;
+        LOG_W("no WIFI_EAP_CA_FILE: the RADIUS server certificate is not verified");
+#endif
+        LOG_I("connecting to SSID %s (WPA2-Enterprise PEAP, user %s)",
+              WIFI_SSID, WIFI_EAP_USERNAME);
+        WiFi.begin(WIFI_SSID, WPA2_AUTH_PEAP, identity, WIFI_EAP_USERNAME,
+                   WIFI_EAP_PASSWORD, caPem);
+    } else {
+        LOG_I("connecting to SSID %s", WIFI_SSID);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
 
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {

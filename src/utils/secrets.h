@@ -19,6 +19,22 @@
 #define WIFI_PASSWORD "CHANGE_ME"
 #endif
 
+// WPA2-Enterprise (PEAP / MSCHAPv2), e.g. eduroam or a residence 802.1X
+// network. Setting WIFI_EAP_USERNAME switches the join to enterprise mode and
+// WIFI_PASSWORD is ignored. WIFI_EAP_IDENTITY is the "anonymous identity"
+// (outer identity); empty means the username is used.
+#ifndef WIFI_EAP_IDENTITY
+#define WIFI_EAP_IDENTITY ""
+#endif
+#ifndef WIFI_EAP_USERNAME
+#define WIFI_EAP_USERNAME ""
+#endif
+#ifndef WIFI_EAP_PASSWORD
+#define WIFI_EAP_PASSWORD ""
+#endif
+// WIFI_EAP_CA_PEM (from WIFI_EAP_CA_FILE in .env) is optional; without it the
+// RADIUS server's certificate is not checked.
+
 // MQTT broker for the local Mosquitto instance. Port 1883 is plaintext.
 #ifndef MQTT_BROKER
 #define MQTT_BROKER "192.168.1.10"
