@@ -5,6 +5,8 @@
 #include <WiFiManager.h>
 #include <time.h>
 
+#include <memory>
+
 #include "utils/logger.h"
 
 // One set of Wi-Fi credentials: WPA2-Personal, or WPA2-Enterprise (PEAP)
@@ -27,9 +29,12 @@ public:
         return instance;
     }
 
-    bool initWiFi(int portalTimeoutSeconds = 180);
+    // Starts joining in the background and returns at once: sampling must not
+    // wait for Wi-Fi. If no configured network answers, loop() opens the
+    // captive portal (non-blocking too), then keeps retrying every 30 s.
+    void initWiFi(int portalTimeoutSeconds = 180);
 
-    // Non-blocking except for a bounded reconnect attempt every 30 s.
+    // Never blocks: drives the join / portal / retry state machine.
     void loop();
 
     bool isWifiConnected() { return WiFi.status() == WL_CONNECTED; }
@@ -52,18 +57,35 @@ private:
     NetworkManager(const NetworkManager&) = delete;
     NetworkManager& operator=(const NetworkManager&) = delete;
 
+    enum class State { JOINING, PORTAL, CONNECTED, OFFLINE };
+
     static WifiCreds compiledCreds();
     static WifiCreds activeCreds();
-    bool tryJoin(const WifiCreds& creds, unsigned long timeoutMs);
-    bool connectWithSecrets(unsigned long timeoutMs);
-    bool connectWithPortal(int timeoutSeconds);
+    static bool usable(const WifiCreds& c);
+    void beginJoin(const WifiCreds& creds);           // returns at once
+    bool tryJoin(const WifiCreds& creds, unsigned long timeoutMs);  // blocking, for switchNetwork
+    void loadCandidates();
+    bool joinNextCandidate();
+    void startPortal();
+    void closePortal();
+    void enter(State next);
     void startNtp();
 
-    bool ntpStarted = false;
-    unsigned long lastWiFiReconnectAttempt = 0;
-    int wifiReconnectCount = 0;
+    State state = State::OFFLINE;
+    unsigned long stateSince = 0;
 
-    static const unsigned long WIFI_RECONNECT_INTERVAL = 30000;
-    static const int MAX_WIFI_RETRIES = 3;
+    // Networks to try, in order: the one set remotely, then the .env one.
+    WifiCreds candidates[2];
+    int candidateCount = 0;
+    int candidateIndex = 0;
+
+    std::unique_ptr<WiFiManager> portal;
+    int portalTimeoutSeconds = 180;
+    bool portalOpened = false;  // once per boot
+
+    bool ntpStarted = false;
+
+    static const unsigned long JOIN_TIMEOUT_MS = 15000;
+    static const unsigned long RETRY_INTERVAL_MS = 30000;
     static const unsigned long SWITCH_TIMEOUT_MS = 20000;
 };

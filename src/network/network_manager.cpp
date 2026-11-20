@@ -31,9 +31,11 @@ WifiCreds NetworkManager::activeCreds() {
     return compiledCreds();
 }
 
-bool NetworkManager::tryJoin(const WifiCreds& c, unsigned long timeoutMs) {
-    if (c.ssid.length() == 0 || c.ssid == "CHANGE_ME") return false;
+bool NetworkManager::usable(const WifiCreds& c) {
+    return c.ssid.length() > 0 && c.ssid != "CHANGE_ME";
+}
 
+void NetworkManager::beginJoin(const WifiCreds& c) {
     WiFi.disconnect(true, true);  // drop the current association and its EAP state
     delay(100);
     WiFi.mode(WIFI_STA);
@@ -53,33 +55,23 @@ bool NetworkManager::tryJoin(const WifiCreds& c, unsigned long timeoutMs) {
         LOG_I("connecting to SSID %s", c.ssid.c_str());
         WiFi.begin(c.ssid.c_str(), c.password.c_str());
     }
+}
+
+bool NetworkManager::tryJoin(const WifiCreds& c, unsigned long timeoutMs) {
+    if (!usable(c)) return false;
+    beginJoin(c);
 
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
-        esp_task_wdt_reset();  // no-op before the watchdog is armed in setup()
+        esp_task_wdt_reset();
         delay(250);
     }
     return WiFi.status() == WL_CONNECTED;
 }
 
-bool NetworkManager::connectWithSecrets(unsigned long timeoutMs) {
-    WifiCreds remote;
-    bool hasRemote = RuntimeConfig::getInstance().getWifiOverride(remote);
-    if (hasRemote) {
-        if (tryJoin(remote, timeoutMs)) return true;
-        // A network set remotely may have disappeared; the compiled one is the safety net.
-        LOG_W("remotely configured SSID %s unreachable; trying the one from .env", remote.ssid.c_str());
-    }
-    WifiCreds compiled = compiledCreds();
-    if (compiled.ssid == "CHANGE_ME") {
-        LOG_I("no WIFI_SSID in .env; using the config portal");
-        return false;
-    }
-    return tryJoin(compiled, timeoutMs);
-}
-
 bool NetworkManager::switchNetwork(const WifiCreds* candidate, String& error) {
     // candidate == nullptr: forget the remote network and go back to .env.
+    // Blocking on purpose: the command must ack with the outcome.
     WifiCreds previous = activeCreds();
     WifiCreds target = candidate ? *candidate : compiledCreds();
 
@@ -90,76 +82,129 @@ bool NetworkManager::switchNetwork(const WifiCreds* candidate, String& error) {
             RuntimeConfig::getInstance().clearWifiOverride();
         }
         LOG_I("now on SSID %s ip=%s rssi=%d dBm", target.ssid.c_str(), ip().c_str(), (int)rssi());
+        enter(State::CONNECTED);
         return true;
     }
 
     error = String("could not join ") + target.ssid + "; back on " + previous.ssid;
     LOG_W("%s", error.c_str());
-    if (!tryJoin(previous, SWITCH_TIMEOUT_MS)) {
-        LOG_E("previous network unreachable too; loop() keeps retrying");
+    if (tryJoin(previous, SWITCH_TIMEOUT_MS)) {
+        enter(State::CONNECTED);
+    } else {
+        LOG_E("previous network unreachable too; retrying in the background");
+        enter(State::OFFLINE);
     }
     return false;
 }
 
-bool NetworkManager::connectWithPortal(int timeoutSeconds) {
-    WiFiManager wifiManager;
-    wifiManager.setConfigPortalTimeout(timeoutSeconds);
-
-    LOG_I("opening config portal 'SenPork-setup' for %d s", timeoutSeconds);
-    if (!wifiManager.autoConnect("SenPork-setup")) {
-        LOG_E("config portal timed out without credentials");
-        return false;
+void NetworkManager::loadCandidates() {
+    candidateCount = 0;
+    candidateIndex = 0;
+    WifiCreds remote;
+    if (RuntimeConfig::getInstance().getWifiOverride(remote) && usable(remote)) {
+        candidates[candidateCount++] = remote;
     }
-    return WiFi.status() == WL_CONNECTED;
+    WifiCreds compiled = compiledCreds();
+    if (usable(compiled)) {
+        candidates[candidateCount++] = compiled;
+    }
 }
 
-bool NetworkManager::initWiFi(int portalTimeoutSeconds) {
-    if (connectWithSecrets(15000)) {
-        LOG_I("WiFi connected ip=%s rssi=%d dBm", ip().c_str(), (int)rssi());
-        wifiReconnectCount = 0;
-        startNtp();
-        return true;
-    }
+bool NetworkManager::joinNextCandidate() {
+    if (candidateIndex >= candidateCount) return false;
+    beginJoin(candidates[candidateIndex++]);
+    enter(State::JOINING);
+    return true;
+}
 
-    if (connectWithPortal(portalTimeoutSeconds)) {
-        LOG_I("WiFi connected via portal ip=%s rssi=%d dBm",
-              ip().c_str(), (int)rssi());
-        wifiReconnectCount = 0;
-        startNtp();
-        return true;
-    }
+void NetworkManager::startPortal() {
+    portalOpened = true;
+    portal.reset(new WiFiManager());
+    portal->setConfigPortalBlocking(false);
+    portal->setConfigPortalTimeout(portalTimeoutSeconds);
+    LOG_I("opening config portal 'SenPork-setup' for %d s; sensors keep sampling",
+          portalTimeoutSeconds);
+    portal->startConfigPortal("SenPork-setup");
+    enter(State::PORTAL);
+}
 
-    LOG_E("WiFi unavailable; sampling continues offline");
-    return false;
+void NetworkManager::closePortal() {
+    if (!portal) return;
+    if (portal->getConfigPortalActive()) portal->stopConfigPortal();
+    portal.reset();
+}
+
+void NetworkManager::enter(State next) {
+    state = next;
+    stateSince = millis();
+}
+
+void NetworkManager::initWiFi(int portalTimeout) {
+    portalTimeoutSeconds = portalTimeout;
+    WiFi.setAutoReconnect(true);
+    loadCandidates();
+    if (!joinNextCandidate()) {
+        LOG_I("no WIFI_SSID in .env; using the config portal");
+        startPortal();
+    }
 }
 
 void NetworkManager::loop() {
-    if (WiFi.status() != WL_CONNECTED) {
-        unsigned long now = millis();
-        if (now - lastWiFiReconnectAttempt >= WIFI_RECONNECT_INTERVAL) {
-            lastWiFiReconnectAttempt = now;
-            LOG_W("WiFi lost; reconnect attempt %d of %d",
-                  wifiReconnectCount + 1, MAX_WIFI_RETRIES);
-            WiFi.reconnect();
+    if (portal) portal->process();  // serves the portal page, handles its timeout
 
-            unsigned long start = millis();
-            while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-                delay(250);
+    if (isWifiConnected()) {
+        if (state != State::CONNECTED) {
+            if (state == State::PORTAL) {
+                // Keep what was typed in the portal: the next join wipes the
+                // driver's stored config, the remote-override slot survives.
+                WifiCreds typed;
+                typed.ssid = WiFi.SSID();
+                typed.password = WiFi.psk();
+                RuntimeConfig::getInstance().setWifiOverride(typed);
+                closePortal();
             }
-
-            if (WiFi.status() == WL_CONNECTED) {
-                LOG_I("WiFi reconnected ip=%s rssi=%d dBm",
-                      ip().c_str(), (int)rssi());
-                wifiReconnectCount = 0;
-                startNtp();
-            } else {
-                wifiReconnectCount++;
-                if (wifiReconnectCount >= MAX_WIFI_RETRIES) {
-                    LOG_E("%d failed reconnects; keeping the node alive", wifiReconnectCount);
-                    wifiReconnectCount = 0;
-                }
-            }
+            LOG_I("WiFi connected ssid=%s ip=%s rssi=%d dBm",
+                  WiFi.SSID().c_str(), ip().c_str(), (int)rssi());
+            enter(State::CONNECTED);
+            startNtp();
         }
+        return;
+    }
+
+    unsigned long elapsed = millis() - stateSince;
+    switch (state) {
+    case State::CONNECTED:
+        // The driver auto-reconnects; we only take over if that fails.
+        LOG_W("WiFi lost; sampling continues, frames queue until it is back");
+        enter(State::OFFLINE);
+        break;
+
+    case State::JOINING:
+        if (elapsed < JOIN_TIMEOUT_MS) break;
+        LOG_W("no answer from SSID %s after %lu s",
+              candidates[candidateIndex - 1].ssid.c_str(), JOIN_TIMEOUT_MS / 1000);
+        if (joinNextCandidate()) break;
+        if (!portalOpened) {
+            startPortal();
+        } else {
+            LOG_W("WiFi unavailable; sampling continues offline, retry in %lu s",
+                  RETRY_INTERVAL_MS / 1000);
+            enter(State::OFFLINE);
+        }
+        break;
+
+    case State::PORTAL:
+        if (portal && portal->getConfigPortalActive()) break;
+        LOG_W("config portal closed without credentials; sampling continues offline");
+        closePortal();
+        enter(State::OFFLINE);
+        break;
+
+    case State::OFFLINE:
+        if (elapsed < RETRY_INTERVAL_MS) break;
+        loadCandidates();
+        if (!joinNextCandidate()) enter(State::OFFLINE);  // nothing configured: wait again
+        break;
     }
 }
 
