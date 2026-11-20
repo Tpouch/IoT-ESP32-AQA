@@ -59,6 +59,7 @@ ApiClient::Result ApiClient::post(const String& path, const JsonDocument& body,
     if (code <= 0) {
         // Negative codes are transport errors (DNS, TLS, timeout).
         LOG_W("api: POST %s failed: %s", path.c_str(), HTTPClient::errorToString(code).c_str());
+        diagnoseTransport();
         stateText = "unreachable";
         return Result::RETRY;
     }
@@ -215,4 +216,66 @@ void ApiClient::loop() {
     } else {
         backoff();
     }
+}
+
+void ApiClient::diagnoseTransport() {
+    // HTTPClient reports every pre-TLS failure as "connection refused"; split
+    // it into DNS vs TCP so the log says which side to look at.
+    esp_task_wdt_reset();
+    String host = Config().getApiUrl();
+    int scheme = host.indexOf("://");
+    if (scheme >= 0) host = host.substring(scheme + 3);
+    uint16_t port = secure ? 443 : 80;
+    int slash = host.indexOf('/');
+    if (slash >= 0) host = host.substring(0, slash);
+    int colon = host.indexOf(':');
+    if (colon >= 0) {
+        port = host.substring(colon + 1).toInt();
+        host = host.substring(0, colon);
+    }
+
+    IPAddress addr;
+    if (!WiFi.hostByName(host.c_str(), addr)) {
+        LOG_W("api diag: DNS lookup of %s failed (dns=%s)", host.c_str(),
+              WiFi.dnsIP().toString().c_str());
+        return;
+    }
+    WiFiClient probe;
+    unsigned long start = millis();
+    bool ok = probe.connect(addr, port, 4000);
+    probe.stop();
+    if (ok) {
+        LOG_W("api diag: %s -> %s, TCP %u OK in %lu ms: the failure is TLS/HTTP, not the network",
+              host.c_str(), addr.toString().c_str(), port, millis() - start);
+    } else {
+        LOG_W("api diag: %s -> %s, TCP %u failed after %lu ms (firewall / network blocks it)",
+              host.c_str(), addr.toString().c_str(), port, millis() - start);
+        probePlainHttp(host, addr);
+    }
+}
+
+void ApiClient::probePlainHttp(const String& host, const IPAddress& addr) {
+    // Same address on port 80: if that works the network filters 443 only;
+    // if the answer is not Cloudflare's redirect, a captive portal / walled
+    // garden is intercepting this device.
+    esp_task_wdt_reset();
+    WiFiClient probe;
+    if (!probe.connect(addr, 80, 4000)) {
+        LOG_W("api diag: TCP 80 fails too: this device has no Internet access "
+              "(walled garden, device not allowed on the network?)");
+        return;
+    }
+    probe.printf("HEAD / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", host.c_str());
+    probe.setTimeout(4000);
+    String status = probe.readStringUntil('\n');
+    String location;
+    while (probe.connected() || probe.available()) {
+        String line = probe.readStringUntil('\n');
+        if (line.length() <= 1) break;
+        if (line.startsWith("Location:") || line.startsWith("location:")) location = line;
+    }
+    probe.stop();
+    status.trim();
+    location.trim();
+    LOG_W("api diag: TCP 80 OK, answer: %s %s", status.c_str(), location.c_str());
 }

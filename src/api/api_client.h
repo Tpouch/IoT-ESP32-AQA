@@ -50,6 +50,8 @@ private:
     bool sendFrames();
     void runCommands(JsonDocument& response);
     void backoff();
+    void diagnoseTransport();  // logs whether DNS or TCP is what fails
+    void probePlainHttp(const String& host, const IPAddress& addr);
 
     String devicePath(const char* suffix) const;
 

@@ -70,6 +70,14 @@ private:
     void closePortal();
     void enter(State next);
     void startNtp();
+    void reportDisconnectReason();
+    static const char* reasonHint(uint8_t reason);
+
+    // Last STA_DISCONNECTED reason, written by the Wi-Fi event task and
+    // logged from loop() (logging from the event task would race the logger).
+    static volatile uint8_t lastReason;
+    uint8_t reportedReason = 0;
+    bool eventHooked = false;
 
     State state = State::OFFLINE;
     unsigned long stateSince = 0;

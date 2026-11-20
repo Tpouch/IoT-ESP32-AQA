@@ -5,6 +5,8 @@
 #include "utils/runtime_config.h"
 #include "utils/secrets.h"
 
+volatile uint8_t NetworkManager::lastReason = 0;
+
 String NetworkManager::generateDeviceID() {
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -39,6 +41,8 @@ void NetworkManager::beginJoin(const WifiCreds& c) {
     WiFi.disconnect(true, true);  // drop the current association and its EAP state
     delay(100);
     WiFi.mode(WIFI_STA);
+    lastReason = 0;
+    reportedReason = 0;
 
     if (c.isEnterprise()) {
         // WPA2-Enterprise, PEAP outer tunnel, MSCHAPv2 inside (the IDF default).
@@ -141,6 +145,12 @@ void NetworkManager::enter(State next) {
 
 void NetworkManager::initWiFi(int portalTimeout) {
     portalTimeoutSeconds = portalTimeout;
+    if (!eventHooked) {
+        WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
+            lastReason = info.wifi_sta_disconnected.reason;
+        }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+        eventHooked = true;
+    }
     WiFi.setAutoReconnect(true);
     loadCandidates();
     if (!joinNextCandidate()) {
@@ -151,6 +161,7 @@ void NetworkManager::initWiFi(int portalTimeout) {
 
 void NetworkManager::loop() {
     if (portal) portal->process();  // serves the portal page, handles its timeout
+    reportDisconnectReason();
 
     if (isWifiConnected()) {
         if (state != State::CONNECTED) {
@@ -181,8 +192,10 @@ void NetworkManager::loop() {
 
     case State::JOINING:
         if (elapsed < JOIN_TIMEOUT_MS) break;
-        LOG_W("no answer from SSID %s after %lu s",
-              candidates[candidateIndex - 1].ssid.c_str(), JOIN_TIMEOUT_MS / 1000);
+        LOG_W("no answer from SSID %s after %lu s (last reason: %s)",
+              candidates[candidateIndex - 1].ssid.c_str(), JOIN_TIMEOUT_MS / 1000,
+              lastReason ? WiFi.disconnectReasonName((wifi_err_reason_t)lastReason)
+                         : "none, the AP never answered");
         if (joinNextCandidate()) break;
         if (!portalOpened) {
             startPortal();
@@ -219,4 +232,33 @@ void NetworkManager::startNtp() {
 
 bool NetworkManager::timeSynced() {
     return time(nullptr) > 1600000000L;
+}
+
+void NetworkManager::reportDisconnectReason() {
+    uint8_t reason = lastReason;
+    if (reason == 0 || reason == reportedReason) return;  // once per distinct reason and join
+    reportedReason = reason;
+    LOG_W("wifi disconnect reason %u (%s): %s", reason,
+          WiFi.disconnectReasonName((wifi_err_reason_t)reason), reasonHint(reason));
+}
+
+const char* NetworkManager::reasonHint(uint8_t reason) {
+    switch (reason) {
+    case WIFI_REASON_NO_AP_FOUND:
+        return "SSID not seen: check the exact name (case, spaces) and that it is on 2.4 GHz";
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_802_1X_AUTH_FAILED:
+        return "authentication refused: check WIFI_EAP_USERNAME / WIFI_EAP_PASSWORD";
+    case WIFI_REASON_AUTH_EXPIRE:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "no handshake: wrong password, or the network does not use PEAP/MSCHAPv2";
+    case WIFI_REASON_ASSOC_FAIL:
+    case WIFI_REASON_ASSOC_EXPIRE:
+        return "association refused by the AP (MAC filter or too many clients?)";
+    case WIFI_REASON_BEACON_TIMEOUT:
+        return "signal lost: board too far from the AP";
+    default:
+        return "see esp_wifi_types.h";
+    }
 }
