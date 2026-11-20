@@ -2,60 +2,56 @@
 #include "../../utils/logger.h"
 
 bool PMSensor::init(int rxPin, int txPin) {
-    try {
-        // Create new instances with smart pointers
-        serialPort = std::unique_ptr<SoftwareSerial>(new SoftwareSerial(rxPin, txPin));
-        if (!serialPort) {
-            LOG_E("Failed to allocate memory for PM sensor serial port");
-            return false;
-        }
-        
-        serialPort->begin(9600);
-        
-        pms = std::unique_ptr<PMS>(new PMS(*serialPort));
-        if (!pms) {
-            LOG_E("Failed to allocate memory for PM sensor");
-            serialPort.reset(); // Not strictly necessary as the unique_ptr will clean up
-            return false;
-        }
-        
-        pms->wakeUp();
-        delay(500); // Give the sensor time to wake up and initialize
-        
-        LOG_I("PM sensor initialized on pins RX:%d, TX:%d", rxPin, txPin);
-        return true;
-    } catch (...) {
-        LOG_E("Exception during PM sensor initialization");
-        return false;
-    }
+    serialPort.reset(new SoftwareSerial());
+    // An input-only txPin (GPIO 34..39) is silently skipped by EspSoftwareSerial:
+    // RX still works, commands to the sensor just go nowhere.
+    serialPort->begin(9600, SWSERIAL_8N1, rxPin, txPin, false, RX_BUFFER_BYTES);
+
+    pms.reset(new PMS(*serialPort));
+    pms->wakeUp();
+    lastFrameMs = millis();
+
+    LOG_I("PM sensor initialized on pins RX:%d, TX:%d", rxPin, txPin);
+    return true;
 }
 
-bool PMSensor::read(uint16_t& pm25) {
+bool PMSensor::read(uint16_t& pm25, unsigned long timeoutMs) {
     if (!pms) {
         LOG_E("PM sensor not initialized");
         return false;
     }
-    
-    unsigned long startTime = millis();
-    while (millis() - startTime < READ_TIMEOUT) {
-        if (pms->readUntil(data)) {
-            // Basic validation - reject implausible values
-            if (data.PM_AE_UG_2_5 > 1000) {
-                LOG_W("PM sensor reading out of range: %d µg/m³", data.PM_AE_UG_2_5);
-                return false; // Unlikely valid reading
+
+    bool got = false;
+    unsigned long start = millis();
+    for (;;) {
+        // PMS::read() consumes one byte per call; drain the buffer and keep the
+        // newest complete frame.
+        while (serialPort->available()) {
+            if (!pms->read(data)) {
+                continue;
             }
-            
+            if (data.PM_AE_UG_2_5 > MAX_PLAUSIBLE_UG) {
+                LOG_W("PM sensor reading out of range: %u µg/m³", data.PM_AE_UG_2_5);
+                continue;
+            }
             pm25 = data.PM_AE_UG_2_5;
-            LOG_V("PM2.5 reading: %d µg/m³", pm25);
-            return true;
+            lastFrameMs = millis();
+            got = true;
         }
-        
-        // Short delay before next read attempt
+        if (got || millis() - start >= timeoutMs) {
+            break;
+        }
         delay(10);
     }
-    
-    LOG_W("PM sensor read timeout");
-    return false;
+
+    if (got) {
+        LOG_V("PM2.5 reading: %u µg/m³", pm25);
+    }
+    return got;
+}
+
+unsigned long PMSensor::msSinceLastFrame() const {
+    return millis() - lastFrameMs;
 }
 
 void PMSensor::wakeUp() {
@@ -72,23 +68,4 @@ void PMSensor::sleep() {
     } else {
         LOG_W("Cannot sleep uninitialized PM sensor");
     }
-}
-
-bool PMSensor::readWithRetry(uint16_t& pm25, int maxRetries, int retryDelayMs) {
-    for (int i = 0; i < maxRetries; i++) {
-        if (read(pm25)) {
-            if (i > 0) {
-                LOG_D("PM sensor reading successful after %d retries", i);
-            }
-            return true;
-        }
-        
-        if (i < maxRetries - 1) {
-            LOG_D("Retrying PM sensor reading (%d/%d)...", i + 1, maxRetries);
-            delay(retryDelayMs);
-        }
-    }
-    
-    LOG_W("PM sensor reading failed after %d retries", maxRetries);
-    return false;
 }

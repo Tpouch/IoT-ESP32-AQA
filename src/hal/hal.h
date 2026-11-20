@@ -70,4 +70,7 @@ private:
     // failed attempt can cost ~5 s (the S8 library's UART timeout).
     static const int CO2_INIT_ATTEMPTS = 2;
     static const unsigned long CO2_WARMUP_MS = 60000;
+
+    // Longest PMS7003 frame interval is 2.3 s; leave margin for a cold start.
+    static const unsigned long PM_DETECT_TIMEOUT_MS = 3000;
 }; 

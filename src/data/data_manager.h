@@ -97,6 +97,10 @@ private:
     // Task timing constants
     static const int SOUND_SAMPLE_TIME = 120;
     static const int PM_SAMPLE_TIME = 400;
+    // No PMS frame for this long means the sensor went silent (frames come
+    // at least every 2.3 s when it is alive).
+    static const unsigned long PM_STALE_MS = 10000;
+    bool pmStaleReported = false;
     static const int CO2_SAMPLE_TIME = 2000;
     static const int HT_SAMPLE_TIME = 15000;
     static const int SEND_DATA_TIME = 15000;

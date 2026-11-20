@@ -12,8 +12,11 @@
 //
 // UART pins are named from the ESP32's point of view: *_ESP_RX is the GPIO the
 // ESP32 listens on, so it is wired to the sensor's TX line (and vice versa).
-// GPIO 34..39 are input-only on the ESP32: the PMS TX line must land on 34 or
-// 35, which makes GPIO 34 the ESP32's RX for the PM sensor.
+// PMS7003: verified on the bench, the sensor's TX line reaches GPIO 14, and its
+// RX sits on GPIO 34. GPIO 34..39 are input-only, so the ESP32 can never talk
+// to the PMS: EspSoftwareSerial skips an input-only TX pin, so nothing leaves
+// the ESP32. That is fine, the PMS7003 boots in active mode and streams frames on
+// its own; wakeUp()/sleep() commands simply never reach it.
 
 struct BoardPins {
     static const int DHT_PIN = 13;
@@ -22,8 +25,8 @@ struct BoardPins {
     static const int ADC_SOUND = 35;
 
     // PMS7003 on SoftwareSerial.
-    static const int PM_ESP_RX = 34;   // <- PMS TX
-    static const int PM_ESP_TX = 14;   // -> PMS RX
+    static const int PM_ESP_RX = 14;   // <- PMS TX
+    static const int PM_ESP_TX = 34;   // -> PMS RX
 
     // MH-Z19 / SenseAir S8 on Serial2 (the ESP32 core defaults, RX2/TX2).
     static const int CO2_ESP_RX = 16;  // <- sensor TX

@@ -132,25 +132,20 @@ bool HAL::initCO2Sensor(HardwareSerial& serial, int espRx, int espTx,
 bool HAL::initPMSensor(int espRx, int espTx) {
     LOG_I("Initializing PM sensor...");
     
-    for (int i = 0; i < MAX_INIT_RETRIES; i++) {
-        try {
-            pmSensor.init(espRx, espTx);
-            
-            // Test the sensor by reading values
-            uint16_t pm25;
-            if (pmSensor.read(pm25)) {
-                LOG_I("PM sensor initialized. Current PM2.5 reading: %u µg/m³", pm25);
-                pmSensorInitialized = true;
-                return true;
-            }
-            
-            LOG_W("PM sensor initialization attempt %d failed, retrying...", i + 1);
-            delay(100);
-        } catch (...) {
-            LOG_E("Exception during PM sensor initialization");
-        }
+    pmSensor.init(espRx, espTx);
+
+    // The sensor streams on its own; one frame within the longest PMS7003
+    // interval (2.3 s) is enough to call it present. Reopening the port
+    // between attempts would not make it talk sooner.
+    uint16_t pm25;
+    if (pmSensor.read(pm25, PM_DETECT_TIMEOUT_MS)) {
+        LOG_I("PM sensor initialized. Current PM2.5 reading: %u µg/m³", pm25);
+        pmSensorInitialized = true;
+        return true;
     }
-    
+
+    LOG_W("No PMS frame within %lu ms; check the PMS TX line and 5 V supply",
+          PM_DETECT_TIMEOUT_MS);
     return false;
 }
 

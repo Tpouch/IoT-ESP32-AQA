@@ -63,11 +63,20 @@ void DataManager::pmSampleCallback() {
     if (instance && instance->hal) {
         uint16_t pm25;
         if (instance->hal->isSensorInitialized(SENSOR_PM)) {
-            if (instance->hal->getPMSensor().readWithRetry(pm25, 3, 200)) {
+            // Non-blocking: most ticks find no new frame, which is normal.
+            PMSensor& pm = instance->hal->getPMSensor();
+            if (pm.read(pm25)) {
                 instance->pm25Samples.push_back(pm25);
                 LOG_D("PM2.5: %u µg/m³", pm25);
-            } else {
-                LOG_W("PM sensor read failed after retries");
+                if (instance->pmStaleReported) {
+                    LOG_I("PM sensor frames are back");
+                    instance->pmStaleReported = false;
+                }
+            } else if (!instance->pmStaleReported &&
+                       pm.msSinceLastFrame() > PM_STALE_MS) {
+                LOG_W("No PM frame for %lu s; check the PMS TX line and 5 V supply",
+                      PM_STALE_MS / 1000);
+                instance->pmStaleReported = true;
             }
         } else {
             LOG_V("PM sensor not initialized, skipping reading");
